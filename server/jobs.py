@@ -7,6 +7,7 @@ job simply has no runtime entry and cannot be aborted.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import shutil
 import string
@@ -17,6 +18,7 @@ from typing import Any
 
 from config import home_dir
 from persistence import (
+    TERMINAL,
     delete_persisted_job,
     find_persisted_job,
     remember_repo,
@@ -69,6 +71,53 @@ def get_job_with_fallback(task_id: str) -> dict[str, Any] | None:
     (repos.json) — fixes the restart bug where a persisted job became
     unreachable once the in-memory registry was gone."""
     return _jobs.get(task_id) or find_persisted_job(task_id)
+
+
+async def wait_for_tasks(
+    task_ids: list[str], timeout_s: int | None, wait_timeout_s: int, hard_cap_s: int,
+) -> dict[str, Any]:
+    """§6.2: returns immediately if any listed task already needs input or is
+    done; otherwise sleeps in 1s ticks until any task's status changes or the
+    (hard-capped) timeout elapses. Lives here (stdlib) rather than in main.py
+    so it's testable without the `mcp` dependency — main.py's wait_for_tasks
+    tool is a thin wrapper that supplies the two Defaults-derived bounds.
+    """
+    budget = min(timeout_s or wait_timeout_s, hard_cap_s)
+    start = time.time()
+
+    def snapshot() -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for tid in task_ids:
+            j = get_job_with_fallback(tid)
+            if not j:
+                rows.append({"task_id": tid, "status": "unknown", "done": True, "error": "unknown task_id"})
+                continue
+            status = j.get("status")
+            row: dict[str, Any] = {"task_id": tid, "status": status, "done": status in TERMINAL}
+            if j.get("lastStep"):
+                row["step"] = j["lastStep"]
+            if j.get("costUsd") is not None:
+                row["cost_usd"] = j["costUsd"]
+            if status == "needs_input" and j.get("question"):
+                row["question"] = {"id": j["question"].get("id"), "message": j["question"].get("message")}
+            rows.append(row)
+        return rows
+
+    def fingerprint(rows: list[dict[str, Any]]) -> tuple:
+        return tuple((r["task_id"], r["status"], (r.get("question") or {}).get("id")) for r in rows)
+
+    initial = snapshot()
+    if any(r["done"] or r["status"] == "needs_input" for r in initial):
+        return {"elapsed_s": 0, "changed": False, "tasks": initial}
+
+    initial_print = fingerprint(initial)
+    while time.time() - start < budget:
+        await asyncio.sleep(1)
+        current = snapshot()
+        if fingerprint(current) != initial_print:
+            return {"elapsed_s": round(time.time() - start, 1), "changed": True, "tasks": current}
+
+    return {"elapsed_s": round(time.time() - start, 1), "changed": False, "tasks": snapshot()}
 
 
 def persist_job(job: dict[str, Any]) -> None:
@@ -151,18 +200,6 @@ def stage_files(worktree: str, files: list[str]) -> None:
         _git(worktree, "add", "-A", "--", path)
 
 
-def _rename_destination(path: str) -> str:
-    """`numstat`'s rename form is `old => new` or `dir/{old => new}/rest` —
-    keep only the destination."""
-    if "{" in path and "}" in path:
-        pre, rest = path.split("{", 1)
-        mid, post = rest.split("}", 1)
-        _old, new = mid.split(" => ", 1)
-        return f"{pre}{new}{post}"
-    _old, new = path.split(" => ", 1)
-    return new
-
-
 def diff_and_stat(worktree: str, base_sha: str) -> dict[str, Any]:
     """Staged diff against `base_sha`: patch text plus a numstat summary.
 
@@ -170,9 +207,16 @@ def diff_and_stat(worktree: str, base_sha: str) -> dict[str, Any]:
     in-scope subset (stage_files) and still get an accurate diffstat for
     exactly that subset. Binary files report 0/0 added/removed (numstat's
     `-`/`-`) but are still listed in `files`.
+
+    `--no-renames` on both calls: rename detection collapses a rename to its
+    destination path only (numstat's `old => new`), which would silently
+    drop the ORIGIN path from `files`/`filesChanged` — a git_ops.integrate
+    dirty_overlap check (or a scope_check) keyed only on the destination
+    would then miss the user's own unrelated changes to the file under its
+    old name. Plain add+delete pairs keep both paths visible.
     """
-    patch = _git(worktree, "diff", "--cached", "--binary", base_sha).stdout
-    numstat = _git(worktree, "diff", "--cached", "--numstat", "-M", base_sha).stdout
+    patch = _git(worktree, "diff", "--cached", "--binary", "--no-renames", base_sha).stdout
+    numstat = _git(worktree, "diff", "--cached", "--numstat", "--no-renames", base_sha).stdout
     files: list[dict[str, Any]] = []
     added = removed = 0
     for line in numstat.splitlines():
@@ -184,8 +228,6 @@ def diff_and_stat(worktree: str, base_sha: str) -> dict[str, Any]:
         added_str, removed_str, path = parts
         a = int(added_str) if added_str != "-" else 0
         r = int(removed_str) if removed_str != "-" else 0
-        if " => " in path:
-            path = _rename_destination(path)
         files.append({"path": path, "added": a, "removed": r})
         added += a
         removed += r

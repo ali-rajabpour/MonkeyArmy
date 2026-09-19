@@ -142,7 +142,10 @@ def _read_conventions(repo: str, max_chars: int) -> str:
     return ""
 
 
-def build_brief(job: dict[str, Any], args: dict[str, Any], defaults: Defaults, feedback: str | None = None) -> Path:
+def build_brief(
+    job: dict[str, Any], args: dict[str, Any], defaults: Defaults,
+    feedback_history: list[dict[str, Any]] | None = None,
+) -> Path:
     """Write comm/<id>/brief.md (§8.2) and return its path. Rebuilt (with a
     feedback section appended) on every retry — the worker always reads the
     brief file fresh, so this is the only thing that needs to change between
@@ -180,14 +183,12 @@ def build_brief(job: dict[str, Any], args: dict[str, Any], defaults: Defaults, f
         parts += ["", "# Repository conventions (excerpt of AGENTS.md / CLAUDE.md)", conventions]
     if notes:
         parts += ["", "# Supervisor notes for this repository", notes]
-    if feedback:
-        attempt = job.get("attempt", 1)
-        parts += [
-            "",
-            f"# Supervisor feedback on attempt {attempt}",
-            feedback,
-            "Your previous changes are present in the working directory. Fix them; do not start over.",
-        ]
+    if feedback_history:
+        # One section PER attempt, not just the latest — a worker on attempt
+        # 3 needs to see what it was told after attempts 1 AND 2.
+        for entry in feedback_history:
+            parts += ["", f"# Supervisor feedback on attempt {entry['attempt']}", entry["feedback"]]
+        parts += ["Your previous changes are present in the working directory. Fix them; do not start over."]
 
     comm_dir = comm_dir_for(job)
     comm_dir.mkdir(parents=True, exist_ok=True)
@@ -227,12 +228,12 @@ def _build_args(cfg: Defaults, args: dict[str, Any], brief_path: Path) -> list[s
 
 async def run_worker(
     cfg: Defaults, job: dict[str, Any], args: dict[str, Any], timeout_ms: int,
-    feedback: str | None = None,
+    feedback_history: list[dict[str, Any]] | None = None,
 ) -> None:
     """Run one delegated task to completion, mutating + persisting `job`."""
     comm_dir = comm_dir_for(job)
     comm_dir.mkdir(parents=True, exist_ok=True)
-    brief_path = build_brief(job, args, cfg, feedback=feedback)
+    brief_path = build_brief(job, args, cfg, feedback_history=feedback_history)
 
     ask_timeout_s = args.get("ask_timeout_s") or cfg.ask_timeout_s
     env = build_spawn_env(job, args, comm_dir, ask_timeout_s)
@@ -438,11 +439,15 @@ async def run_worker(
     await loop.run_in_executor(None, verify.finalize_success, job, cfg)
 
 
-async def retry(cfg: Defaults, job: dict[str, Any], args: dict[str, Any], feedback: str, timeout_ms: int) -> None:
-    """Re-spawn the worker in the SAME worktree with a "Supervisor feedback"
-    section appended to the brief — used by review_task(verdict='reject')
-    (WP5). Caller is responsible for having already bumped job["attempt"]
-    and set job["status"] = "running" before awaiting this.
+async def retry(
+    cfg: Defaults, job: dict[str, Any], args: dict[str, Any],
+    feedback_history: list[dict[str, Any]], timeout_ms: int,
+) -> None:
+    """Re-spawn the worker in the SAME worktree with the brief extended by
+    one "Supervisor feedback on attempt N" section per past attempt — used
+    by review_task(verdict='reject'). Caller is responsible for having
+    already bumped job["attempt"], appended to job["feedbackHistory"], and
+    set job["status"] = "running" before awaiting this.
     """
     job.pop("question", None)
-    await run_worker(cfg, job, args, timeout_ms, feedback=feedback)
+    await run_worker(cfg, job, args, timeout_ms, feedback_history=feedback_history)

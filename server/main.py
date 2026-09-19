@@ -26,10 +26,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mcp.server.fastmcp import FastMCP
 
 import backend
+import batches
 import events
+import git_ops
 import store
 import statusline_render
 import verify as verify_mod
+import worker_launcher
 from config import load_defaults
 from jobs import (
     changed_files,
@@ -39,13 +42,41 @@ from jobs import (
     persist_job,
     put_job,
     runtime,
+    wait_for_tasks as jobs_wait_for_tasks,
 )
-from persistence import TERMINAL as TERMINAL_STATES
+from persistence import ACTIVE as ACTIVE_STATES, REVIEWABLE, TERMINAL as TERMINAL_STATES
 from proc_utils import kill_tree
 from worker_launcher import comm_dir_for, run_worker
 
 cfg = load_defaults()
 mcp = FastMCP("monkey-army")
+
+
+def _build_worker_args(job: dict[str, Any], resolved: dict[str, Any]) -> dict[str, Any]:
+    """Shared by dispatch_task (first attempt) and review_task's reject path
+    (retry): re-resolves the profile fresh and rebuilds the launcher's args
+    from the job's own persisted fields, so a retry works even across a
+    server restart without needing to keep secrets on the job."""
+    limits = resolved["limits"]
+    mode = job.get("mode", "micro")
+    recursion_default = limits["recursion_limit_micro"] if mode == "micro" else limits["recursion_limit_task"]
+    prices = resolved.get("price_per_mtok") or {}
+    return {
+        "title": job.get("title"), "spec": job.get("spec"), "worktree": job["worktree"],
+        "test_command": job.get("testCommand"), "definition_of_done": job.get("definitionOfDone"),
+        "allowed_files": job.get("allowedFiles") or [], "context_files": job.get("contextFiles") or [],
+        "mode": mode, "model": resolved["model"], "api_base": resolved.get("api_base"),
+        "api_key_env_var": resolved.get("api_key_env_var"), "api_key": resolved.get("api_key"),
+        "fallback_models": resolved.get("fallback_models") or [],
+        "model_kwargs": resolved.get("model_kwargs") or {},
+        "price_in": prices.get("input"), "price_out": prices.get("output"),
+        "max_budget_usd": job.get("maxBudgetUsd") or limits["max_budget_usd"],
+        "max_tokens_total": job.get("maxTokensTotal") or limits["max_tokens_total"],
+        "recursion_limit": recursion_default,
+        "rubric_max_iterations": limits["rubric_max_iterations_task"],
+        "command_timeout": limits["command_timeout_s"],
+        "ask_timeout_s": limits["ask_timeout_s"],
+    }
 
 
 @mcp.tool(
@@ -109,6 +140,10 @@ async def dispatch_task(
         "status": "running", "attempt": 1, "turns": 0,
         "costUsd": None, "totalTokens": None, "priced": False, "modelsSeen": [],
         "model": resolved["model"],  # for the status line / watch stream
+        # Persisted (not just passed to this run) so review_task's retry —
+        # possibly after a server restart — reuses the same caps rather than
+        # silently reverting to the profile's defaults.
+        "maxBudgetUsd": max_budget_usd, "maxTokensTotal": max_tokens_total, "timeoutS": timeout_s,
     }
     if batch_id:
         job["batchId"] = batch_id
@@ -117,6 +152,11 @@ async def dispatch_task(
     put_job(job)
     persist_job(job)
     statusline_render.write_statusline(job)
+    if batch_id and batch_key:
+        try:
+            batches.link(repo_path, batch_id, batch_key, wt["taskId"])
+        except KeyError as e:
+            warnings.append(f"batch link failed: {e}")
 
     # Preflight the acceptance gate BEFORE spending worker tokens: a broken
     # test RUNNER (vs merely failing assertions) makes the rubric unpassable
@@ -134,24 +174,7 @@ async def dispatch_task(
         )
 
     limits = resolved["limits"]
-    recursion_default = limits["recursion_limit_micro"] if mode == "micro" else limits["recursion_limit_task"]
-    prices = resolved.get("price_per_mtok") or {}
-    args = {
-        "title": title, "spec": spec, "worktree": wt["worktree"],
-        "test_command": test_command, "definition_of_done": definition_of_done,
-        "allowed_files": allowed_files or [], "context_files": context_files or [],
-        "mode": mode, "model": resolved["model"], "api_base": resolved.get("api_base"),
-        "api_key_env_var": resolved.get("api_key_env_var"), "api_key": resolved.get("api_key"),
-        "fallback_models": resolved.get("fallback_models") or [],
-        "model_kwargs": resolved.get("model_kwargs") or {},
-        "price_in": prices.get("input"), "price_out": prices.get("output"),
-        "max_budget_usd": max_budget_usd or limits["max_budget_usd"],
-        "max_tokens_total": max_tokens_total or limits["max_tokens_total"],
-        "recursion_limit": recursion_default,
-        "rubric_max_iterations": limits["rubric_max_iterations_task"],
-        "command_timeout": limits["command_timeout_s"],
-        "ask_timeout_s": limits["ask_timeout_s"],
-    }
+    args = _build_worker_args(job, resolved)
     # The worker runs as a background asyncio task; job state is mutated live
     # by worker_launcher (same event loop) and mirrored to disk on every change.
     run_timeout_ms = int((timeout_s or limits["timeout_s"]) * 1000)
@@ -447,12 +470,158 @@ async def cleanup_task(task_id: str, delete_branch: bool | None = None) -> str:
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
-    if j.get("status") == "running":
+    if j.get("status") in ACTIVE_STATES:
         return json.dumps(
-            {"task_id": task_id, "error": "task is still running; abort or wait before calling cleanup_task"}
+            {"task_id": task_id, "error": f"task is active (status: {j.get('status')}); "
+                                           "abort or wait before calling cleanup_task"}
         )
     result = cleanup_job(j, delete_branch if delete_branch is not None else True)
     return json.dumps({"task_id": task_id, "cleaned": True, **result})
+
+
+@mcp.tool(
+    description=(
+        "Records your verdict on a finished ('succeeded') task. 'approve' unlocks integrate_task "
+        "— nothing merges without this. 'reject' (needs feedback, >=10 chars) re-spawns the worker "
+        "in the SAME worktree with your feedback appended to the brief, incrementing attempt "
+        "(max 3 — beyond that, do it yourself or re-decompose into a fresh task)."
+    )
+)
+async def review_task(task_id: str, verdict: str, feedback: str | None = None) -> str:
+    j = get_job_with_fallback(task_id)
+    if not j:
+        return json.dumps({"error": "unknown task_id"})
+    if j.get("status") not in REVIEWABLE:
+        return json.dumps({"task_id": task_id, "error": f"task not reviewable (status: {j.get('status')})"})
+    if verdict not in ("approve", "reject"):
+        return json.dumps({"error": f"verdict must be 'approve' or 'reject', got {verdict!r}"})
+
+    if verdict == "approve":
+        if j.get("status") != "succeeded":
+            return json.dumps(
+                {"task_id": task_id, "error": f"approve requires status 'succeeded' (status: {j.get('status')})"}
+            )
+        j["review"] = {"verdict": "approve", "feedback": feedback, "at": time.time()}
+        persist_job(j)
+        return json.dumps({"task_id": task_id, "review": j["review"], "next": "integrate_task(task_id)"})
+
+    # reject
+    if not feedback or len(feedback) < 10:
+        return json.dumps({"error": "reject requires feedback of at least 10 characters"})
+    if not j.get("worktree") or not Path(j["worktree"]).is_dir():
+        return json.dumps({"task_id": task_id, "error": "worktree no longer exists; re-dispatch instead of retrying"})
+    attempt = j.get("attempt", 1)
+    if attempt >= 3:
+        return json.dumps({
+            "task_id": task_id,
+            "error": "max retry attempts (3) reached — do it yourself, or re-decompose into a fresh task",
+        })
+
+    j["review"] = {"verdict": "reject", "feedback": feedback, "at": time.time()}
+    j.setdefault("feedbackHistory", []).append({"attempt": attempt, "feedback": feedback})
+    j["attempt"] = attempt + 1
+    j["status"] = "running"
+    persist_job(j)
+    statusline_render.write_statusline(j)
+    events.publish(j["repo"], task_id, {"kind": "retry", "attempt": j["attempt"], "feedback": feedback[:300]})
+
+    try:
+        resolved = store.resolve_profile(j.get("profile"))
+    except KeyError as e:
+        return json.dumps({"error": str(e)})
+    args = _build_worker_args(j, resolved)
+    run_timeout_ms = int((j.get("timeoutS") or resolved["limits"]["timeout_s"]) * 1000)
+    task = asyncio.create_task(
+        worker_launcher.retry(cfg, j, args, j["feedbackHistory"], run_timeout_ms)
+    )
+    runtime.setdefault(j["taskId"], {})["task"] = task
+
+    return json.dumps({"task_id": task_id, "attempt": j["attempt"], "status": "running"})
+
+
+@mcp.tool(
+    description=(
+        "Waits, sleeping in 1s ticks server-side, until any listed task changes status or needs "
+        "input; returns immediately if one already does. Prefer this over polling; each poll turn "
+        "re-sends your whole context. Hard cap 170s per call — call again to keep waiting on tasks "
+        "still running."
+    )
+)
+async def wait_for_tasks(task_ids: list[str], timeout_s: int | None = None) -> str:
+    result = await jobs_wait_for_tasks(task_ids, timeout_s, cfg.wait_timeout_s, cfg.wait_hard_cap_s)
+    return json.dumps(result)
+
+
+@mcp.tool(
+    description=(
+        "Merges an approved task's patch into repo_path's CURRENT branch: dry-run checked first, "
+        "then applied atomically (never half-merged) and, in 'commit' mode, committed under the "
+        "user's own git identity. Requires review_task(verdict='approve') first. On conflict, "
+        "nothing changes — re-dispatch against the current branch and integrate again."
+    )
+)
+async def integrate_task(
+    task_id: str, message: str | None = None, mode: str | None = None,
+    allow_branch_mismatch: bool = False,
+) -> str:
+    j = get_job_with_fallback(task_id)
+    if not j:
+        return json.dumps({"error": "unknown task_id"})
+    integrate_mode = mode or cfg.integrate_mode
+    try:
+        result = git_ops.integrate(j, j["repo"], message, integrate_mode, allow_branch_mismatch)
+    except Exception as e:  # noqa: BLE001 - never leak a raw traceback to the supervisor
+        return json.dumps({
+            "task_id": task_id, "integrated": False, "reason": "error",
+            "detail": f"{type(e).__name__}: {e}",
+        })
+    return json.dumps(result)
+
+
+@mcp.tool(
+    description=(
+        "Manages a multi-task batch. create(repo_path, goal, tasks_json) validates dependencies/"
+        "scope overlap and returns parallel waves; status(batch_id, repo_path) shows progress; "
+        "finish(batch_id, repo_path) integrates every approved task in dependency order and "
+        "reports totals. tasks_json: JSON list of {key, title, dependsOn?, allowedFiles?}."
+    )
+)
+async def batch(
+    action: str, repo_path: str | None = None, batch_id: str | None = None,
+    goal: str | None = None, tasks_json: str | None = None,
+    verify_command: str | None = None, mode: str | None = None,
+) -> str:
+    if action == "create":
+        if not repo_path or not goal or not tasks_json:
+            return json.dumps({"error": "create requires repo_path, goal, tasks_json"})
+        try:
+            tasks = json.loads(tasks_json)
+        except json.JSONDecodeError as e:
+            return json.dumps({"error": f"invalid tasks_json: {e}"})
+        if not isinstance(tasks, list):
+            return json.dumps({"error": "tasks_json must be a JSON list"})
+        try:
+            return json.dumps(batches.create(repo_path, goal, tasks, verify_command, mode))
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+
+    if action == "status":
+        if not repo_path or not batch_id:
+            return json.dumps({"error": "status requires repo_path and batch_id"})
+        try:
+            return json.dumps(batches.status(repo_path, batch_id))
+        except KeyError as e:
+            return json.dumps({"error": str(e)})
+
+    if action == "finish":
+        if not repo_path or not batch_id:
+            return json.dumps({"error": "finish requires repo_path and batch_id"})
+        try:
+            return json.dumps(batches.finish(repo_path, batch_id, verify_command, mode, cfg))
+        except KeyError as e:
+            return json.dumps({"error": str(e)})
+
+    return json.dumps({"error": f"unknown action {action!r}"})
 
 
 # ── Configuration facade (§6.13) ─────────────────────────────────────────
