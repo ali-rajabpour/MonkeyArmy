@@ -2,9 +2,10 @@
 # requires-python = ">=3.11"
 # dependencies = ["mcp<2"]
 # ///
-"""monkey-army MCP server (§6): thin registration of the 12 tools, delegating
-everything to the stdlib-only modules beside it. Runs over stdio via
-`uv run server/main.py`.
+"""monkey-army MCP server (§6): thin registration of the 13 tools §6 actually
+defines (its own summary line says "12"; docs record the discrepancy),
+delegating everything to the stdlib-only modules beside it. Runs over stdio
+via `uv run server/main.py`.
 
 Only this module imports `mcp`; config/store/jobs/persistence/verify/
 backend/worker_launcher are stdlib-only so unit tests run without any
@@ -15,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -50,33 +50,6 @@ from worker_launcher import comm_dir_for, run_worker
 
 cfg = load_defaults()
 mcp = FastMCP("monkey-army")
-
-
-def _build_worker_args(job: dict[str, Any], resolved: dict[str, Any]) -> dict[str, Any]:
-    """Shared by dispatch_task (first attempt) and review_task's reject path
-    (retry): re-resolves the profile fresh and rebuilds the launcher's args
-    from the job's own persisted fields, so a retry works even across a
-    server restart without needing to keep secrets on the job."""
-    limits = resolved["limits"]
-    mode = job.get("mode", "micro")
-    recursion_default = limits["recursion_limit_micro"] if mode == "micro" else limits["recursion_limit_task"]
-    prices = resolved.get("price_per_mtok") or {}
-    return {
-        "title": job.get("title"), "spec": job.get("spec"), "worktree": job["worktree"],
-        "test_command": job.get("testCommand"), "definition_of_done": job.get("definitionOfDone"),
-        "allowed_files": job.get("allowedFiles") or [], "context_files": job.get("contextFiles") or [],
-        "mode": mode, "model": resolved["model"], "api_base": resolved.get("api_base"),
-        "api_key_env_var": resolved.get("api_key_env_var"), "api_key": resolved.get("api_key"),
-        "fallback_models": resolved.get("fallback_models") or [],
-        "model_kwargs": resolved.get("model_kwargs") or {},
-        "price_in": prices.get("input"), "price_out": prices.get("output"),
-        "max_budget_usd": job.get("maxBudgetUsd") or limits["max_budget_usd"],
-        "max_tokens_total": job.get("maxTokensTotal") or limits["max_tokens_total"],
-        "recursion_limit": recursion_default,
-        "rubric_max_iterations": limits["rubric_max_iterations_task"],
-        "command_timeout": limits["command_timeout_s"],
-        "ask_timeout_s": limits["ask_timeout_s"],
-    }
 
 
 @mcp.tool(
@@ -174,7 +147,7 @@ async def dispatch_task(
         )
 
     limits = resolved["limits"]
-    args = _build_worker_args(job, resolved)
+    args = worker_launcher.build_worker_args(job, resolved)
     # The worker runs as a background asyncio task; job state is mutated live
     # by worker_launcher (same event loop) and mirrored to disk on every change.
     run_timeout_ms = int((timeout_s or limits["timeout_s"]) * 1000)
@@ -206,10 +179,10 @@ async def dispatch_task(
         "CHEAP liveness check — call often while supervising. Tiny payload: status (running / "
         "needs_input / succeeded / failed / timeout / cancelled), a `done` flag, and the pending "
         "question if blocked. On 'needs_input' use answer_worker; on `done` call task_result. "
-        "For files written so far and recent activity, call get_task_progress instead."
+        "For files written so far and recent activity, call task_progress instead."
     )
 )
-async def get_task_status(task_id: str) -> str:
+async def task_status(task_id: str) -> str:
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
@@ -235,13 +208,13 @@ async def get_task_status(task_id: str) -> str:
 
 @mcp.tool(
     description=(
-        "VERBOSE progress audit — heavier than get_task_status, so call it occasionally (on your "
-        "own estimate) or when the user asks 'how's it going?'. Reports elapsed time, step count, "
-        "cost so far, the files the worker has touched in its worktree, and its most recent "
-        "activity (shell commands, notes) so you can actually see what it's doing."
+        "VERBOSE progress audit — heavier than task_status, so call it occasionally (on your own "
+        "estimate) or when the user asks 'how's it going?'. Reports elapsed time, step count, cost "
+        "so far, the files the worker has touched in its worktree, and its most recent activity "
+        "(shell commands, notes). If it looks stuck, steer_task or cancel_task; otherwise keep waiting."
     )
 )
-async def get_task_progress(task_id: str, activity_limit: int = 12) -> str:
+async def task_progress(task_id: str, activity_limit: int = 8) -> str:
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
@@ -465,7 +438,13 @@ async def answer_worker(task_id: str, answer: str) -> str:
     return json.dumps({"task_id": task_id, "delivered": True, "question_id": question["id"]})
 
 
-@mcp.tool(description="Removes the worktree, branch, and persisted file for a finished task.")
+@mcp.tool(
+    description=(
+        "Removes the worktree, branch, and persisted file for a finished (non-active) task. Call "
+        "once you're done with task_result's patch/summary and (if integrated) after integrate_task "
+        "— nothing more can be done with the task afterward. Refuses while running/needs_input/verifying."
+    )
+)
 async def cleanup_task(task_id: str, delete_branch: bool | None = None) -> str:
     j = get_job_with_fallback(task_id)
     if not j:
@@ -529,7 +508,7 @@ async def review_task(task_id: str, verdict: str, feedback: str | None = None) -
         resolved = store.resolve_profile(j.get("profile"))
     except KeyError as e:
         return json.dumps({"error": str(e)})
-    args = _build_worker_args(j, resolved)
+    args = worker_launcher.build_worker_args(j, resolved)
     run_timeout_ms = int((j.get("timeoutS") or resolved["limits"]["timeout_s"]) * 1000)
     task = asyncio.create_task(
         worker_launcher.retry(cfg, j, args, j["feedbackHistory"], run_timeout_ms)
@@ -696,39 +675,6 @@ async def _configure_store_key(profile: str, key: str | None) -> str:
     return json.dumps({"profile": profile, "stored_as": env_var, "via": via, "note": note})
 
 
-def _configure_prune_repo(repo: str, older_than_days: int) -> dict[str, Any]:
-    cutoff = time.time() - older_than_days * 86400
-    jobs_dir = store.repo_state_dir(repo) / "jobs"
-    removed_jobs = removed_patches = removed_logs = 0
-    for job_file in (jobs_dir.glob("*.json") if jobs_dir.is_dir() else []):
-        try:
-            job = json.loads(job_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if job.get("status") not in TERMINAL_STATES:
-            continue
-        ts = job.get("finishedAt") or job.get("startedAt") or 0
-        if ts and ts > cutoff:
-            continue
-        task_id = job.get("taskId") or job_file.stem
-        job_file.unlink(missing_ok=True)
-        removed_jobs += 1
-        patch = store.repo_state_dir(repo) / "patches" / f"{task_id}.diff"
-        if patch.exists():
-            patch.unlink()
-            removed_patches += 1
-        log = store.repo_state_dir(repo) / "logs" / f"{task_id}.jsonl"
-        if log.exists():
-            log.unlink()
-            removed_logs += 1
-    try:
-        subprocess.run(["git", "worktree", "prune"], cwd=repo, capture_output=True, text=True,
-                        stdin=subprocess.DEVNULL, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return {"repo": repo, "jobs_removed": removed_jobs, "patches_removed": removed_patches, "logs_removed": removed_logs}
-
-
 @mcp.tool(
     description=(
         "Only call mutating actions when the user explicitly asked for a configuration change. "
@@ -847,7 +793,7 @@ async def configure(
 
     if action == "prune":
         repos = [str(Path(repo_path).resolve())] if repo_path else store.all_repos()
-        results = [_configure_prune_repo(r, older_than_days or 14) for r in repos]
+        results = [store.prune_repo(r, older_than_days or 14) for r in repos]
         return json.dumps({"pruned": results})
 
     return json.dumps({"error": f"unknown action {action!r}"})

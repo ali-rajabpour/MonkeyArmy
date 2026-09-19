@@ -24,12 +24,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 from config import load_defaults
 from config import home_dir as home_dir  # re-exported: "Keep: ... home_dir()" (§7.1)
+from persistence import TERMINAL
 from persistence import (
     all_repos as all_repos,
     remember_repo as remember_repo,
@@ -327,3 +330,41 @@ def append_note(repo_path: str | Path, text: str) -> None:
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(combined, encoding="utf-8")
+
+
+# ── Maintenance (§6.13 `configure(action='prune')`) ─────────────────────
+
+def prune_repo(repo: str, older_than_days: int) -> dict[str, Any]:
+    """Delete logs/patches/jobs of TERMINAL tasks older than N days, and
+    `git worktree prune` the repo. Never raises — a corrupt job file is
+    skipped, not fatal to the sweep."""
+    cutoff = time.time() - older_than_days * 86400
+    jobs_dir = repo_state_dir(repo) / "jobs"
+    removed_jobs = removed_patches = removed_logs = 0
+    for job_file in (jobs_dir.glob("*.json") if jobs_dir.is_dir() else []):
+        try:
+            job = json.loads(job_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if job.get("status") not in TERMINAL:
+            continue
+        ts = job.get("finishedAt") or job.get("startedAt") or 0
+        if ts and ts > cutoff:
+            continue
+        task_id = job.get("taskId") or job_file.stem
+        job_file.unlink(missing_ok=True)
+        removed_jobs += 1
+        patch = repo_state_dir(repo) / "patches" / f"{task_id}.diff"
+        if patch.exists():
+            patch.unlink()
+            removed_patches += 1
+        log = repo_state_dir(repo) / "logs" / f"{task_id}.jsonl"
+        if log.exists():
+            log.unlink()
+            removed_logs += 1
+    try:
+        subprocess.run(["git", "worktree", "prune"], cwd=repo, capture_output=True, text=True,
+                        stdin=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return {"repo": repo, "jobs_removed": removed_jobs, "patches_removed": removed_patches, "logs_removed": removed_logs}

@@ -4,7 +4,7 @@
 as it arrives:
 
 - ``PROGRESS:`` lines refresh job["progress"] + lastActivityTs (persisted so
-  get_task_status sees them live) and feed the event bus (watch stream);
+  task_status sees them live) and feed the event bus (watch stream);
 - ``QUESTION:`` lines flip the job to ``needs_input`` — the worker is then
   blocked waiting for answer_worker to drop a file in the comm dir;
 - the final ``RESULT_JSON:`` line decides success/failure;
@@ -19,7 +19,7 @@ as it arrives:
   own while it waits on the provider. Exempts ``needs_input``, an
   intentional bounded wait for a supervisor answer;
 - any non-succeeded ending triggers a salvage pass so completed-but-
-  uncommitted work still reaches fetch_task_result.
+  uncommitted work still reaches task_result.
 
 Before spawning, this module also assembles the worker's brief file (§8.2)
 and the spawn environment: the env is filtered of anything that looks like a
@@ -197,6 +197,37 @@ def build_brief(
     return brief_path
 
 
+def build_worker_args(job: dict[str, Any], resolved: dict[str, Any]) -> dict[str, Any]:
+    """The `args` dict `run_worker`/`retry` need, built from a job's own
+    persisted fields plus a freshly `store.resolve_profile`d profile.
+
+    Shared by dispatch_task (first attempt) and review_task's reject path
+    (retry): re-resolving fresh — rather than keeping the launch args around
+    on the job — means a retry works even across a server restart, and never
+    needs to persist secrets on the job.
+    """
+    limits = resolved["limits"]
+    mode = job.get("mode", "micro")
+    recursion_default = limits["recursion_limit_micro"] if mode == "micro" else limits["recursion_limit_task"]
+    prices = resolved.get("price_per_mtok") or {}
+    return {
+        "title": job.get("title"), "spec": job.get("spec"), "worktree": job["worktree"],
+        "test_command": job.get("testCommand"), "definition_of_done": job.get("definitionOfDone"),
+        "allowed_files": job.get("allowedFiles") or [], "context_files": job.get("contextFiles") or [],
+        "mode": mode, "model": resolved["model"], "api_base": resolved.get("api_base"),
+        "api_key_env_var": resolved.get("api_key_env_var"), "api_key": resolved.get("api_key"),
+        "fallback_models": resolved.get("fallback_models") or [],
+        "model_kwargs": resolved.get("model_kwargs") or {},
+        "price_in": prices.get("input"), "price_out": prices.get("output"),
+        "max_budget_usd": job.get("maxBudgetUsd") or limits["max_budget_usd"],
+        "max_tokens_total": job.get("maxTokensTotal") or limits["max_tokens_total"],
+        "recursion_limit": recursion_default,
+        "rubric_max_iterations": limits["rubric_max_iterations_task"],
+        "command_timeout": limits["command_timeout_s"],
+        "ask_timeout_s": limits["ask_timeout_s"],
+    }
+
+
 def _fmt_opt(value: Any) -> str:
     """CLI convention worker.py expects: empty string means "unset" (§8.2)."""
     return "" if value is None else str(value)
@@ -307,7 +338,7 @@ async def run_worker(
 
     def _finalize_failure(error: str, kind: str = "failed") -> None:
         # `kind` doubles as the terminal job status (except when cancelled),
-        # so "timeout" actually reaches get_task_status/the status line
+        # so "timeout" actually reaches task_status/the status line
         # instead of always collapsing to "failed".
         job["status"] = "cancelled" if rt.get("cancelled") else kind
         job["error"] = "cancelled by supervisor" if rt.get("cancelled") else error
