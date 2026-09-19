@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mcp"]
+# dependencies = ["mcp<2"]
 # ///
 """monkey-army MCP server, Python edition (parallel implementation of
 src/mcp-server.ts — same four tools, same response shapes, same persisted-job
@@ -27,23 +27,22 @@ import events
 import store
 import statusline_render
 import verify as verify_mod
-from config import load_config
+from config import load_defaults
 from jobs import (
+    changed_files,
     cleanup_job,
     create_worktree,
     get_job_with_fallback,
     persist_job,
     put_job,
     runtime,
-    worktree_changed_files,
 )
+from persistence import TERMINAL as TERMINAL_STATES
 from proc_utils import kill_tree
 from worker_launcher import comm_dir_for, run_worker
 
-cfg = load_config()
+cfg = load_defaults()
 mcp = FastMCP("monkey-army")
-
-TERMINAL_STATES = {"succeeded", "failed", "timeout", "cancelled"}
 
 
 @mcp.tool(
@@ -70,18 +69,14 @@ async def run_dev_task(
     profile: str | None = None,
     max_budget_usd: float | None = None,
 ) -> str:
-    # Resolve model/key per task from the config store (facade profiles),
-    # falling back to legacy env config. Read fresh each call so facade
-    # changes apply without a server restart.
+    # Resolve model/key per task from the config store (facade profiles).
+    # Read fresh each call so facade changes apply without a server restart.
     try:
-        resolved = store.resolve_profile(
-            profile,
-            {"model": cfg.model, "api_key_env_var": cfg.api_key_env_var},
-        )
+        resolved = store.resolve_profile(profile)
     except KeyError as e:
         return json.dumps({"error": str(e)})
 
-    wt = create_worktree(cfg.work_dir, repo_path, base_branch)
+    wt = create_worktree(repo_path, base_branch)
     job: dict[str, Any] = {
         **wt,
         "status": "running",
@@ -91,7 +86,7 @@ async def run_dev_task(
         "model": resolved["model"],  # for the status line / watch stream
     }
     put_job(job)
-    persist_job(job, cfg.work_dir)
+    persist_job(job)
     statusline_render.write_statusline(job)
 
     # Preflight the acceptance gate BEFORE spending worker tokens: a broken
@@ -108,25 +103,26 @@ async def run_dev_task(
         events.publish(
             wt["repo"], wt["taskId"],
             {"kind": "preflight", "note": f"test_command exit={preflight_report.get('exit_code')}"},
-            cfg.work_dir,
         )
 
+    limits = resolved["limits"]
     args = {
         "spec": spec,
         "worktree": wt["worktree"],
         "test_command": test_command,
         "definition_of_done": definition_of_done,
-        "recursion_limit": recursion_limit or cfg.default_recursion_limit,
-        "rubric_max_iterations": cfg.default_rubric_max_iterations,
+        "recursion_limit": recursion_limit or limits["recursion_limit_task"],
+        "rubric_max_iterations": limits["rubric_max_iterations_task"],
         "model": resolved["model"],
         "api_key_env_var": resolved["api_key_env_var"],
         "api_key": resolved["api_key"],
         "fallback_models": resolved["fallback_models"],
-        "max_budget_usd": max_budget_usd or cfg.default_max_budget_usd,
+        "max_budget_usd": max_budget_usd or limits["max_budget_usd"],
     }
     # The worker runs as a background asyncio task; job state is mutated live
     # by worker_launcher (same event loop) and mirrored to disk on every change.
-    task = asyncio.create_task(run_worker(cfg, job, args, timeout_ms or cfg.default_timeout_ms))
+    run_timeout_ms = timeout_ms or int(limits["timeout_s"] * 1000)
+    task = asyncio.create_task(run_worker(cfg, job, args, run_timeout_ms))
     runtime.setdefault(job["taskId"], {})["task"] = task
 
     # A broken test RUNNER makes the acceptance gate unpassable — surface it up
@@ -162,7 +158,7 @@ async def run_dev_task(
     )
 )
 async def get_task_status(task_id: str) -> str:
-    j = get_job_with_fallback(task_id, cfg.work_dir)
+    j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
     status = j.get("status")
@@ -194,7 +190,7 @@ async def get_task_status(task_id: str) -> str:
     )
 )
 async def get_task_progress(task_id: str, activity_limit: int = 12) -> str:
-    j = get_job_with_fallback(task_id, cfg.work_dir)
+    j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
 
@@ -212,10 +208,10 @@ async def get_task_progress(task_id: str, activity_limit: int = 12) -> str:
 
     # Live audit of what the worker has actually written in its worktree.
     if j.get("worktree"):
-        payload["files_touched"] = worktree_changed_files(j["worktree"])
+        payload["files_touched"] = changed_files(j["worktree"])
 
     # Recent activity, newest last, rendered the same way the events feed does.
-    recent = events.read_log(j.get("repo", ""), task_id, cfg.work_dir, limit=activity_limit)
+    recent = events.read_log(j.get("repo", ""), task_id, limit=activity_limit)
     payload["recent_activity"] = [events.event_message(e) for e in recent]
 
     if j.get("question"):
@@ -235,7 +231,7 @@ async def get_task_progress(task_id: str, activity_limit: int = 12) -> str:
     )
 )
 async def fetch_task_result(task_id: str) -> str:
-    j = get_job_with_fallback(task_id, cfg.work_dir)
+    j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
     return json.dumps(
@@ -265,7 +261,7 @@ async def fetch_task_result(task_id: str) -> str:
     )
 )
 async def cancel_task(task_id: str) -> str:
-    j = get_job_with_fallback(task_id, cfg.work_dir)
+    j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
     if j.get("status") != "running" and j.get("status") != "needs_input":
@@ -290,7 +286,7 @@ async def cancel_task(task_id: str) -> str:
             await asyncio.wait_for(asyncio.shield(task), timeout=30)
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
-        j = get_job_with_fallback(task_id, cfg.work_dir) or j
+        j = get_job_with_fallback(task_id) or j
     else:
         # Job from a previous server process: no runtime handle. The tree
         # kill above (via persisted workerPid) is all we can do; finalize
@@ -299,13 +295,12 @@ async def cancel_task(task_id: str) -> str:
 
         j["status"] = "cancelled"
         j["error"] = "cancelled by supervisor (stale job from a previous server session)"
-        if salvage_worktree(cfg.work_dir, j):
+        if salvage_worktree(j):
             j["salvaged"] = True
-        persist_job(j, cfg.work_dir)
+        persist_job(j)
         events.publish(
             j["repo"], task_id,
             {"kind": "cancelled", "error": j["error"], "salvaged": j.get("salvaged", False)},
-            cfg.work_dir,
         )
 
     return json.dumps(
@@ -330,7 +325,7 @@ async def cancel_task(task_id: str) -> str:
     )
 )
 async def steer_task(task_id: str, message: str) -> str:
-    j = get_job_with_fallback(task_id, cfg.work_dir)
+    j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
     if j.get("status") not in ("running", "needs_input"):
@@ -338,7 +333,7 @@ async def steer_task(task_id: str, message: str) -> str:
             {"task_id": task_id, "error": f"task is not active (status: {j.get('status')})"}
         )
 
-    comm_dir = comm_dir_for(j, cfg.work_dir)
+    comm_dir = comm_dir_for(j)
     try:
         comm_dir.mkdir(parents=True, exist_ok=True)
         steer_path = comm_dir / "steer.json"
@@ -348,9 +343,7 @@ async def steer_task(task_id: str, message: str) -> str:
     except OSError as e:
         return json.dumps({"task_id": task_id, "error": f"could not write steer message: {e}"})
 
-    events.publish(
-        j["repo"], task_id, {"kind": "steer", "message": message[:300]}, cfg.work_dir
-    )
+    events.publish(j["repo"], task_id, {"kind": "steer", "message": message[:300]})
     return json.dumps(
         {
             "task_id": task_id, "delivered": "pending",
@@ -367,7 +360,7 @@ async def steer_task(task_id: str, message: str) -> str:
     )
 )
 async def answer_worker(task_id: str, answer: str) -> str:
-    j = get_job_with_fallback(task_id, cfg.work_dir)
+    j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
     question = j.get("question")
@@ -379,7 +372,7 @@ async def answer_worker(task_id: str, answer: str) -> str:
             }
         )
 
-    comm_dir = comm_dir_for(j, cfg.work_dir)
+    comm_dir = comm_dir_for(j)
     try:
         comm_dir.mkdir(parents=True, exist_ok=True)
         answer_path = comm_dir / f"{question['id']}.json"
@@ -396,25 +389,24 @@ async def answer_worker(task_id: str, answer: str) -> str:
     # worker_launcher stall watchdog would treat the resumed run as already
     # expired the instant it stops being "needs_input".
     j["lastActivityTs"] = time.time()
-    persist_job(j, cfg.work_dir)
+    persist_job(j)
     events.publish(
         j["repo"], task_id,
         {"kind": "answer", "question_id": question["id"], "answer": answer[:300]},
-        cfg.work_dir,
     )
     return json.dumps({"task_id": task_id, "delivered": True, "question_id": question["id"]})
 
 
 @mcp.tool(description="Removes the worktree, branch, and persisted file for a finished task.")
 async def cleanup_task(task_id: str, delete_branch: bool | None = None) -> str:
-    j = get_job_with_fallback(task_id, cfg.work_dir)
+    j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
     if j.get("status") == "running":
         return json.dumps(
             {"task_id": task_id, "error": "task is still running; abort or wait before calling cleanup_task"}
         )
-    result = cleanup_job(cfg.work_dir, j, delete_branch if delete_branch is not None else True)
+    result = cleanup_job(j, delete_branch if delete_branch is not None else True)
     return json.dumps({"task_id": task_id, "cleaned": True, **result})
 
 
@@ -447,12 +439,7 @@ async def provider_status() -> str:
             "config_path": str(store.config_path()),
             "default_profile": cfg_store["default_profile"],
             "profiles": profiles,
-            "defaults": {
-                "model": cfg.model,
-                "api_key_env_var": cfg.api_key_env_var,
-                "worker_api_key_set": bool(cfg.worker_api_key),
-                "active_when": "no profile is defined or requested",
-            },
+            "defaults": store.get_defaults(),
         }
     )
 

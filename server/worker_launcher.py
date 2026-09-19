@@ -31,15 +31,16 @@ import time
 from pathlib import Path
 from typing import Any
 
-from config import Config
+from config import Defaults
 from events import publish
-from jobs import collect_diff, persist_job, runtime, salvage_worktree
+from jobs import changed_files, diff_and_stat, persist_job, runtime, salvage_worktree, stage_files, write_patch
 from statusline_render import write_statusline
 from persistence import (
     find_last_result_line,
     parse_progress_line,
     parse_question_line,
     progress_note,
+    repo_state_dir,
     strip_result_marker,
 )
 from proc_utils import kill_tree
@@ -47,19 +48,20 @@ from proc_utils import kill_tree
 WORKER_SCRIPT = str(Path(__file__).resolve().parent.parent / "worker" / "worker.py")
 
 
-def comm_dir_for(job: dict[str, Any], work_dir: str) -> Path:
-    return Path(job["repo"]) / work_dir / "comm" / job["taskId"]
+def comm_dir_for(job: dict[str, Any]) -> Path:
+    return repo_state_dir(job["repo"]) / "comm" / job["taskId"]
 
 
-def _build_args(cfg: Config, args: dict[str, Any]) -> list[str]:
-    # Model and key env var are resolved per task (config_store profile or
-    # legacy env defaults) and passed in via `args` by main.py.
+def _build_args(cfg: Defaults, args: dict[str, Any]) -> list[str]:
+    # Model, key env var and per-profile limits are resolved per task
+    # (store.resolve_profile) and passed in via `args` by main.py; only the
+    # process-wide command timeout comes from cfg here.
     cli = [
         "run", WORKER_SCRIPT,
         "--worktree", args["worktree"],
         "--spec", args["spec"],
-        "--model", args.get("model") or cfg.model,
-        "--api-key-env-var", args.get("api_key_env_var") or cfg.api_key_env_var,
+        "--model", args["model"],
+        "--api-key-env-var", args.get("api_key_env_var") or "",
         "--recursion-limit", str(args["recursion_limit"]),
         "--rubric-max-iterations", str(args["rubric_max_iterations"]),
         "--command-timeout", str(cfg.command_timeout_s),
@@ -75,13 +77,13 @@ def _build_args(cfg: Config, args: dict[str, Any]) -> list[str]:
     return cli
 
 
-async def run_worker(cfg: Config, job: dict[str, Any], args: dict[str, Any], timeout_ms: int) -> None:
+async def run_worker(cfg: Defaults, job: dict[str, Any], args: dict[str, Any], timeout_ms: int) -> None:
     """Run one delegated task to completion, mutating + persisting `job`."""
     # A profile without a stored key (e.g. keyless local routing) runs
     # without MONKEY_WORKER_API_KEY set, so litellm/9Router falls back to
     # whatever default auth the endpoint expects.
     env = {**os.environ}
-    resolved_key = args.get("api_key") or cfg.worker_api_key
+    resolved_key = args.get("api_key")
     if resolved_key:
         env["MONKEY_WORKER_API_KEY"] = resolved_key
     else:
@@ -89,18 +91,18 @@ async def run_worker(cfg: Config, job: dict[str, Any], args: dict[str, Any], tim
 
     # Mailbox for supervisor answers to worker questions (ask_supervisor /
     # report_blocker). The worker polls files here while blocked.
-    comm_dir = comm_dir_for(job, cfg.work_dir)
+    comm_dir = comm_dir_for(job)
     comm_dir.mkdir(parents=True, exist_ok=True)
     env["MONKEY_COMM_DIR"] = str(comm_dir)
 
     def _publish(event: dict[str, Any]) -> None:
-        publish(job["repo"], job["taskId"], event, cfg.work_dir)
+        publish(job["repo"], job["taskId"], event)
 
     def _touch(note: str | None = None) -> None:
         job["lastActivityTs"] = time.time()
         if note:
             job["progress"] = note
-        persist_job(job, cfg.work_dir)
+        persist_job(job)
         write_statusline(job)  # refresh the token-free status line
 
     try:
@@ -120,7 +122,7 @@ async def run_worker(cfg: Config, job: dict[str, Any], args: dict[str, Any], tim
             "'uv' was not found on PATH. The worker needs uv to run worker/worker.py "
             "(https://docs.astral.sh/uv/getting-started/installation/)."
         )
-        persist_job(job, cfg.work_dir)
+        persist_job(job)
         _publish({"kind": "failed", "error": job["error"]})
         return
 
@@ -129,7 +131,7 @@ async def run_worker(cfg: Config, job: dict[str, Any], args: dict[str, Any], tim
     job["workerPid"] = proc.pid
     job["startedAt"] = time.time()
     _touch("worker starting")
-    _publish({"kind": "started", "model": args.get("model") or cfg.model, "pid": proc.pid})
+    _publish({"kind": "started", "model": args["model"], "pid": proc.pid})
 
     result_line: str | None = None
     tail_lines: list[str] = []
@@ -167,9 +169,9 @@ async def run_worker(cfg: Config, job: dict[str, Any], args: dict[str, Any], tim
         job["status"] = "cancelled" if rt.get("cancelled") else kind
         job["error"] = "cancelled by supervisor" if rt.get("cancelled") else error
         job.pop("question", None)
-        if salvage_worktree(cfg.work_dir, job):
+        if salvage_worktree(job):
             job["salvaged"] = True
-        persist_job(job, cfg.work_dir)
+        persist_job(job)
         write_statusline(job)
         _publish({
             "kind": "cancelled" if rt.get("cancelled") else kind,
@@ -198,7 +200,7 @@ async def run_worker(cfg: Config, job: dict[str, Any], args: dict[str, Any], tim
                 continue
             last = job.get("lastActivityTs") or job.get("startedAt") or time.time()
             idle = time.time() - last
-            if idle > cfg.stall_timeout_s:
+            if idle > cfg.stall_s:
                 return f"no activity for {int(idle)}s"
 
     consume_task = asyncio.create_task(consume())
@@ -232,7 +234,7 @@ async def run_worker(cfg: Config, job: dict[str, Any], args: dict[str, Any], tim
         kill_tree(proc.pid)
         _finalize_failure(
             f"worker stalled: {reason} (likely a hung model call, e.g. rubric grading) — "
-            f"killed after the {cfg.stall_timeout_s}s stall timeout instead of waiting the "
+            f"killed after the {cfg.stall_s}s stall timeout instead of waiting the "
             f"full {timeout_ms}ms run timeout",
             kind="timeout",
         )
@@ -265,10 +267,18 @@ async def run_worker(cfg: Config, job: dict[str, Any], args: dict[str, Any], tim
     job.pop("question", None)
 
     if result.get("status") == "succeeded" and not rt.get("cancelled"):
-        diff = collect_diff(cfg.work_dir, job["repo"], job["worktree"], job["taskId"])
-        job.update(diff)
+        # Temporary pass-through: stage everything changed and report the
+        # diff. The full verify/scope/commit pipeline (§7.3 finalize_success)
+        # is WP4 — this WP only needs jobs.py's new primitives wired in.
+        worktree = job["worktree"]
+        files = changed_files(worktree)
+        stage_files(worktree, files)
+        d = diff_and_stat(worktree, job["baseSha"])
+        job["patchPath"] = str(write_patch(job["slug"], job["taskId"], d["patch"]))
+        job["filesChanged"] = [f["path"] for f in d["files"]]
+        job["diffstat"] = {"added": d["added"], "removed": d["removed"], "lines": d["lines"]}
         job["status"] = "succeeded"
-        persist_job(job, cfg.work_dir)
+        persist_job(job)
         write_statusline(job)
         _publish({
             "kind": "succeeded",

@@ -1,21 +1,22 @@
-"""Persistent, per-user configuration store for the facade.
+"""Persistent, per-user configuration store: profiles, credentials,
+defaults, and the repos index (re-exported from persistence.py — see that
+module's docstring for why the repos-index I/O lives there).
 
-Layout on disk (created on first write):
+Layout under home_dir() (config.home_dir):
 
-    ~/.monkey-army/config.json       # profiles + default_profile (no secrets)
-    ~/.monkey-army/credentials.json  # env-var-name -> API key (facade-managed)
+    config.json        {"default_profile": ..., "profiles": {...}, "defaults": {...}}
+    credentials.json   {"<ENV_VAR_NAME>": "<key>"}   mode 0600
+    repos.json         {"<slug>": "/abs/repo/path"}
 
-The store is read PER TASK (at run_dev_task time), never cached at server
-launch — that is what makes configuration changes apply without restarting
-Claude Code. Environment variables remain a fallback so a pre-facade,
-env-only setup keeps working unchanged.
+No secrets ever live in config.json. Everything here is read fresh on every
+call (never cached at server launch) so configuration changes apply without
+restarting Claude Code.
 
 API-key resolution order for a profile's `api_key_env_var`:
-  1. ~/.monkey-army/credentials.json entry (facade-managed, most intentional)
+  1. credentials.json entry (facade-managed, most intentional)
   2. the OS environment variable itself
-  3. legacy MONKEY_WORKER_API_KEY environment variable
-
-Override the store location with MONKEY_ARMY_HOME (used by tests).
+There is no legacy-env fallback model — WP0 removed the old env-only config
+path entirely.
 """
 
 from __future__ import annotations
@@ -23,15 +24,20 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import date
 from pathlib import Path
 from typing import Any
 
-_MODEL_RE = re.compile(r"^[a-z0-9_-]+:.+", re.IGNORECASE)
+from config import load_defaults
+from config import home_dir as home_dir  # re-exported: "Keep: ... home_dir()" (§7.1)
+from persistence import (
+    all_repos as all_repos,
+    remember_repo as remember_repo,
+    repo_state_dir as repo_state_dir,
+    slug_for as slug_for,
+)
 
-
-def home_dir() -> Path:
-    override = os.environ.get("MONKEY_ARMY_HOME")
-    return Path(override) if override else Path.home() / ".monkey-army"
+_LEGACY_PREFIX_RE = re.compile(r"^litellm:", re.IGNORECASE)
 
 
 def config_path() -> Path:
@@ -48,20 +54,26 @@ def _read_json(path: Path) -> dict[str, Any]:
     except FileNotFoundError:
         return {}
     except json.JSONDecodeError:
-        # A corrupt file must not brick every tool; report as empty and let
-        # the next write repair it. provider_status surfaces the anomaly.
+        # A corrupt file must not brick every tool; the next write repairs it.
         return {}
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    # 0600: credentials.json holds secrets; harmless (and applied) for every
+    # other store file written through this helper too.
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def load_store() -> dict[str, Any]:
     store = _read_json(config_path())
     store.setdefault("profiles", {})
     store.setdefault("default_profile", None)
+    store.setdefault("defaults", {})
     return store
 
 
@@ -69,15 +81,61 @@ def save_store(store: dict[str, Any]) -> None:
     _write_json(config_path(), store)
 
 
+# ── Validation (§5.2) ────────────────────────────────────────────────────
+
 def validate_model_string(model: str) -> str | None:
-    """Return an error message if `model` is not a litellm-routable string."""
-    if not _MODEL_RE.match(model):
+    """Error message if `model` is not a usable litellm model string, else None.
+
+    Decision (plan §5.2 left "or a known bare name" unspecified — no such
+    list exists anywhere in the spec): require a `provider/model` shape.
+    Simplest option consistent with the goal; a genuinely bare model name
+    can be added as a follow-up if 9Router ever needs one.
+    """
+    if not isinstance(model, str) or not model.strip():
+        return "model must be a non-empty string"
+    if _LEGACY_PREFIX_RE.match(model):
         return (
-            f"invalid model string {model!r}: expected '<provider-prefix>:<model>' "
-            "(e.g. 'litellm:openai/combo-deepseek-main')"
+            f"invalid model string {model!r}: drop the legacy 'litellm:' prefix "
+            "(e.g. 'openai/combo/deepseek-main')"
+        )
+    if "/" not in model:
+        return (
+            f"invalid model string {model!r}: expected 'provider/model' "
+            "(e.g. 'openai/combo/deepseek-main')"
         )
     return None
 
+
+def validate_api_base(api_base: str | None) -> str | None:
+    if api_base is None:
+        return None
+    if not (api_base.startswith("http://") or api_base.startswith("https://")):
+        return f"invalid api_base {api_base!r}: must start with http:// or https://"
+    return None
+
+
+def validate_prices(price_per_mtok: dict[str, Any] | None) -> str | None:
+    if not price_per_mtok:
+        return None
+    for key in ("input", "output"):
+        value = price_per_mtok.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            return f"invalid price_per_mtok.{key} = {value!r}: must be a number >= 0"
+    return None
+
+
+def validate_limits(limits: dict[str, Any] | None) -> str | None:
+    if not limits:
+        return None
+    for key, value in limits.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            return f"invalid limits.{key} = {value!r}: must be a positive number"
+    return None
+
+
+# ── Profile CRUD ─────────────────────────────────────────────────────────
 
 def set_profile(
     name: str,
@@ -85,6 +143,9 @@ def set_profile(
     api_key_env_var: str | None = None,
     api_base: str | None = None,
     fallback_models: list[str] | None = None,
+    price_per_mtok: dict[str, float] | None = None,
+    model_kwargs: dict[str, Any] | None = None,
+    limits: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     err = validate_model_string(model)
     if err:
@@ -94,6 +155,14 @@ def set_profile(
             ferr = validate_model_string(fm)
             if ferr:
                 raise ValueError(f"invalid fallback model {fm!r}: {ferr}")
+    for err in (
+        validate_api_base(api_base),
+        validate_prices(price_per_mtok),
+        validate_limits(limits),
+    ):
+        if err:
+            raise ValueError(err)
+
     store = load_store()
     profile: dict[str, Any] = {"model": model}
     if api_key_env_var:
@@ -101,10 +170,13 @@ def set_profile(
     if api_base:
         profile["api_base"] = api_base
     if fallback_models:
-        # Same "<provider-prefix>:<model>" convention as the primary model,
-        # for one consistent format in the config file; the worker strips
-        # the prefix before handing these to litellm's own fallback kwarg.
         profile["fallback_models"] = fallback_models
+    if price_per_mtok:
+        profile["price_per_mtok"] = price_per_mtok
+    if model_kwargs:
+        profile["model_kwargs"] = model_kwargs
+    if limits:
+        profile["limits"] = limits
     store["profiles"][name] = profile
     if store["default_profile"] is None:
         store["default_profile"] = name
@@ -141,40 +213,75 @@ def get_credential(env_var_name: str) -> str | None:
     return _read_json(credentials_path()).get(env_var_name)
 
 
-def resolve_profile(profile_name: str | None, env_defaults: dict[str, Any]) -> dict[str, Any]:
-    """Resolve the effective model config for a task.
+# ── Defaults (§7.0) ──────────────────────────────────────────────────────
 
-    Returns {"model", "api_key_env_var", "api_base", "api_key", "source"}.
-    Raises KeyError listing available profiles when an unknown name is asked.
+def get_defaults() -> dict[str, Any]:
+    return dict(load_store().get("defaults") or {})
 
-    With no store (pre-facade setup) and no profile requested, falls back to
-    env_defaults — the server's hardcoded config.py defaults.
+
+def set_defaults(patch: dict[str, Any]) -> dict[str, Any]:
+    store = load_store()
+    store["defaults"] = {**(store.get("defaults") or {}), **patch}
+    save_store(store)
+    return store["defaults"]
+
+
+# ── Resolution ───────────────────────────────────────────────────────────
+
+_LIMIT_FIELDS = (
+    "max_budget_usd", "max_tokens_total", "timeout_s", "stall_s",
+    "command_timeout_s", "ask_timeout_s", "recursion_limit_micro",
+    "recursion_limit_task", "rubric_max_iterations_task",
+)
+
+
+def resolve_profile(name: str | None = None) -> dict[str, Any]:
+    """Resolve the effective config for a task.
+
+    Returns {name, model, api_base, api_key_env_var, api_key,
+    fallback_models, price_per_mtok, model_kwargs, limits, source}.
+    Raises KeyError (listing available profiles, or saying none exist) when
+    the request cannot be satisfied.
     """
     store = load_store()
     profiles = store["profiles"]
-
-    if profile_name:
-        if profile_name not in profiles:
-            available = ", ".join(sorted(profiles)) or "(none defined)"
-            raise KeyError(f"unknown profile {profile_name!r}; available: {available}")
-        chosen, source = profiles[profile_name], f"profile:{profile_name}"
-    elif store["default_profile"] and store["default_profile"] in profiles:
-        chosen, source = profiles[store["default_profile"]], f"profile:{store['default_profile']} (default)"
+    if not profiles:
+        raise KeyError(
+            "no profiles configured; use configure(action='set_profile', ...) to add one"
+        )
+    if name:
+        if name not in profiles:
+            available = ", ".join(sorted(profiles))
+            raise KeyError(f"unknown profile {name!r}; available: {available}")
+        chosen_name, source = name, f"profile:{name}"
+    elif store["default_profile"] in profiles:
+        chosen_name = store["default_profile"]
+        source = f"profile:{chosen_name} (default)"
     else:
-        chosen, source = env_defaults, "environment (legacy)"
+        # Store has profiles but no recorded default — shouldn't normally
+        # happen (set_profile always sets one on first use); fall back to
+        # the first rather than erroring on a merely inconsistent file.
+        chosen_name = next(iter(profiles))
+        source = f"profile:{chosen_name} (first, no default set)"
+    chosen = profiles[chosen_name]
 
     env_var = chosen.get("api_key_env_var")
-    api_key = None
-    if env_var:
-        api_key = get_credential(env_var) or os.environ.get(env_var)
-    api_key = api_key or os.environ.get("MONKEY_WORKER_API_KEY")
+    api_key = (get_credential(env_var) or os.environ.get(env_var)) if env_var else None
+
+    defaults = load_defaults()
+    limits: dict[str, Any] = {field: getattr(defaults, field) for field in _LIMIT_FIELDS}
+    limits.update(chosen.get("limits") or {})
 
     return {
+        "name": chosen_name,
         "model": chosen["model"],
-        "api_key_env_var": env_var,
         "api_base": chosen.get("api_base"),
+        "api_key_env_var": env_var,
         "api_key": api_key,
         "fallback_models": chosen.get("fallback_models") or [],
+        "price_per_mtok": chosen.get("price_per_mtok"),
+        "model_kwargs": chosen.get("model_kwargs") or {},
+        "limits": limits,
         "source": source,
     }
 
@@ -182,8 +289,41 @@ def resolve_profile(profile_name: str | None, env_defaults: dict[str, Any]) -> d
 def auth_state(profile: dict[str, Any]) -> dict[str, Any]:
     """Non-secret auth report for one profile: is a key reachable."""
     env_var = profile.get("api_key_env_var")
-    key_available = bool(
-        (env_var and (get_credential(env_var) or os.environ.get(env_var)))
-        or os.environ.get("MONKEY_WORKER_API_KEY")
-    )
+    key_available = bool(env_var and (get_credential(env_var) or os.environ.get(env_var)))
     return {"api_key_available": key_available}
+
+
+# ── Notes (§7.1, §5.1) ───────────────────────────────────────────────────
+
+_NOTES_HARD_CAP_CHARS = 4000  # file size cap; distinct from Defaults.notes_max_chars,
+# which trims how much gets INJECTED into a worker brief.
+
+
+def notes_path(repo_path: str | Path) -> Path:
+    return repo_state_dir(repo_path) / "notes.md"
+
+
+def read_notes(repo_path: str | Path, max_chars: int | None = None) -> str:
+    try:
+        text = notes_path(repo_path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    return text if max_chars is None else text[-max_chars:]
+
+
+def append_note(repo_path: str | Path, text: str) -> None:
+    """Append a dated line; refuse if the file would grow past 4000 chars."""
+    path = notes_path(repo_path)
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        existing = ""
+    line = f"- {date.today().isoformat()}: {text.strip()}\n"
+    combined = existing + line
+    if len(combined) > _NOTES_HARD_CAP_CHARS:
+        raise ValueError(
+            f"notes.md would exceed {_NOTES_HARD_CAP_CHARS} chars ({len(combined)}); "
+            "prune old notes first"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(combined, encoding="utf-8")

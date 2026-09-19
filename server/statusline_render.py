@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from config import home_dir
+
 # ANSI status colors.
 _RESET = "\033[0m"
 _CYAN = "\033[36m"
@@ -43,7 +45,7 @@ _STYLE: dict[str, tuple[str, str, int]] = {
 
 
 def global_path() -> Path:
-    return Path.home() / ".monkey-army" / "statusline"
+    return home_dir() / "statusline"
 
 
 def short_id(task_id: str) -> str:

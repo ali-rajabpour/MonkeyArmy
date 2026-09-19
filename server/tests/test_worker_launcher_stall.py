@@ -13,6 +13,7 @@ run_worker passes them, so the code under test is unmodified.
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import Config
+from config import Defaults
 from jobs import create_worktree, runtime
 from worker_launcher import run_worker
 
@@ -36,13 +37,10 @@ def _write_mock_script(tmpdir: Path, name: str, body: str) -> Path:
     return path
 
 
-def _make_cfg(*, stall_timeout_s: int) -> Config:
-    return Config(
-        worker_api_key=None, api_key_env_var="X", model="m",
-        default_recursion_limit=10, default_rubric_max_iterations=1,
-        default_max_budget_usd=5.0, default_timeout_ms=1800000,
-        work_dir=".monkey-army", command_timeout_s=30,
-        stall_timeout_s=stall_timeout_s,
+def _make_cfg(*, stall_timeout_s: int) -> Defaults:
+    return Defaults(
+        home=Path(os.environ["MONKEY_ARMY_HOME"]),
+        command_timeout_s=30, stall_s=stall_timeout_s,
     )
 
 
@@ -55,6 +53,8 @@ class _MockSubprocessCase(unittest.IsolatedAsyncioTestCase):
     """Shared repo/worktree setup + the create_subprocess_exec patch."""
 
     def setUp(self):
+        self._home = tempfile.TemporaryDirectory()
+        os.environ["MONKEY_ARMY_HOME"] = self._home.name
         self.tmp = tempfile.TemporaryDirectory()
         self.repo = str(Path(self.tmp.name) / "repo")
         Path(self.repo).mkdir()
@@ -66,9 +66,11 @@ class _MockSubprocessCase(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+        os.environ.pop("MONKEY_ARMY_HOME", None)
+        self._home.cleanup()
 
     def _job_for(self, base_branch: str = "main") -> dict:
-        wt = create_worktree(".monkey-army", self.repo, base_branch)
+        wt = create_worktree(self.repo, base_branch)
         return {**wt, "status": "running", "turns": 0, "costUsd": None, "totalTokens": None}
 
     def _patched_exec(self, script: Path, *, cwd: str | None = None):

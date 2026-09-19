@@ -1,24 +1,26 @@
 """In-memory job registry, git worktree lifecycle, diff collection, cleanup.
 
-Mirror of src/jobs.ts. Jobs are plain dicts (persisted shape — see
-persistence.py); runtime handles live in the separate `runtime` map keyed by
-task id, so a restored-from-disk job simply has no runtime entry and cannot
-be aborted — same semantics as the TypeScript server.
+Jobs are plain dicts (persisted shape — see persistence.py); runtime handles
+live in the separate `runtime` map keyed by task id, so a restored-from-disk
+job simply has no runtime entry and cannot be aborted.
 """
 
 from __future__ import annotations
 
 import secrets
+import shutil
 import string
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
+from config import home_dir
 from persistence import (
     delete_persisted_job,
     find_persisted_job,
     remember_repo,
+    repo_state_dir,
     save_job,
 )
 
@@ -62,15 +64,17 @@ def delete_job(task_id: str) -> None:
     runtime.pop(task_id, None)
 
 
-def get_job_with_fallback(task_id: str, work_dir: str) -> dict[str, Any] | None:
-    """Registry first, then the persisted JSON (jobs from a previous process)."""
-    return _jobs.get(task_id) or find_persisted_job(task_id, work_dir)
+def get_job_with_fallback(task_id: str) -> dict[str, Any] | None:
+    """Registry first, then a scan of every repo the server has ever seen
+    (repos.json) — fixes the restart bug where a persisted job became
+    unreachable once the in-memory registry was gone."""
+    return _jobs.get(task_id) or find_persisted_job(task_id)
 
 
-def persist_job(job: dict[str, Any], work_dir: str) -> None:
+def persist_job(job: dict[str, Any]) -> None:
     """Best-effort persistence; in-memory state stays authoritative."""
     try:
-        save_job(job, work_dir)
+        save_job(job)
     except OSError:
         pass
 
@@ -84,85 +88,169 @@ def _git(repo: str, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def create_worktree(work_dir: str, repo_path: str, base_branch: str | None = None) -> dict[str, str]:
-    """Create the disposable branch + worktree that isolates worker writes."""
+def create_worktree(repo_path: str, base_branch: str | None = None) -> dict[str, str]:
+    """Create the disposable branch + worktree that isolates worker writes
+    from the user's repo (I2). Lives under
+    `<home>/repos/<slug>/worktrees/<task_id>` — never inside the repo.
+    """
     repo = str(Path(repo_path).resolve())
     task_id = new_task_id()
     branch = f"monkey/{task_id}"
-    wt_root = Path(repo) / work_dir / "worktrees"
+    slug = remember_repo(repo)
+    wt_root = repo_state_dir(repo) / "worktrees"
     wt_root.mkdir(parents=True, exist_ok=True)
     worktree = str(wt_root / task_id)
     base = base_branch or _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    base_sha = _git(repo, "rev-parse", base).stdout.strip()
     _git(repo, "worktree", "add", "-b", branch, worktree, base)
-    remember_repo(repo)
-    return {"taskId": task_id, "branch": branch, "worktree": worktree, "repo": repo}
+    return {
+        "taskId": task_id, "branch": branch, "worktree": worktree, "repo": repo,
+        "slug": slug, "baseBranch": base, "baseSha": base_sha,
+    }
 
 
-def worktree_changed_files(worktree: str) -> list[str]:
-    """Files the worker has created/modified in its worktree so far (uncommitted).
+def changed_files(worktree: str) -> list[str]:
+    """Files changed (created/modified/deleted/renamed) in the worktree,
+    uncommitted, working tree + index.
 
-    A live audit for get_task_progress: the worker commits only at salvage/success,
-    so mid-run its work shows up as porcelain status. Never raises — returns [] if
-    the worktree is gone or git errors.
+    Uses `git status --porcelain=v1 -z`: NUL-separated records survive
+    filenames with spaces or newlines, and a rename/copy record is TWO
+    NUL-terminated fields — `XY new-path\\0orig-path\\0` (the -z form drops
+    the ` -> ` the non -z format uses, and puts the CURRENT path first) —
+    which the non -z format cannot be parsed safely when a path contains a
+    space. Never raises — [] if the worktree is gone or git errors.
     """
     try:
-        out = _git(worktree, "status", "--porcelain").stdout
+        out = _git(worktree, "status", "--porcelain=v1", "-z").stdout
     except (subprocess.CalledProcessError, OSError):
         return []
+    tokens = out.split("\0")
     files: list[str] = []
-    for line in out.splitlines():
-        name = line[3:].strip() if len(line) > 3 else line.strip()
-        if name:
-            # `R  old -> new` rename form: keep the destination path.
-            files.append(name.split(" -> ")[-1])
+    i = 0
+    while i < len(tokens):
+        entry = tokens[i]
+        i += 1
+        if not entry:
+            continue
+        status_code, path = entry[:2], entry[3:]
+        files.append(path)
+        if status_code[0] in ("R", "C"):
+            # Rename/copy: the next NUL-terminated token is the ORIGIN path
+            # (already superseded by `path` above) — consume and discard it.
+            i += 1
     return files
 
 
-def collect_diff(work_dir: str, repo: str, worktree: str, task_id: str) -> dict[str, Any]:
-    """Produce the git patch + list of files the worker changed."""
-    _git(worktree, "add", "-A")
-    diff = _git(worktree, "diff", "--cached").stdout
-    names = _git(worktree, "diff", "--cached", "--name-only").stdout
-    patch_dir = Path(repo) / work_dir / "patches"
+def stage_files(worktree: str, files: list[str]) -> None:
+    """Stage exactly `files`, one `git add -A -- <path>` per path — never a
+    bare `git add -A`, which would sweep up changes a caller deliberately
+    left unstaged (e.g. out-of-scope files, §7.3). `-A` per path still
+    handles deletions.
+    """
+    for path in files:
+        _git(worktree, "add", "-A", "--", path)
+
+
+def _rename_destination(path: str) -> str:
+    """`numstat`'s rename form is `old => new` or `dir/{old => new}/rest` —
+    keep only the destination."""
+    if "{" in path and "}" in path:
+        pre, rest = path.split("{", 1)
+        mid, post = rest.split("}", 1)
+        _old, new = mid.split(" => ", 1)
+        return f"{pre}{new}{post}"
+    _old, new = path.split(" => ", 1)
+    return new
+
+
+def diff_and_stat(worktree: str, base_sha: str) -> dict[str, Any]:
+    """Staged diff against `base_sha`: patch text plus a numstat summary.
+
+    Operates on whatever is currently staged, so a caller can stage only the
+    in-scope subset (stage_files) and still get an accurate diffstat for
+    exactly that subset. Binary files report 0/0 added/removed (numstat's
+    `-`/`-`) but are still listed in `files`.
+    """
+    patch = _git(worktree, "diff", "--cached", "--binary", base_sha).stdout
+    numstat = _git(worktree, "diff", "--cached", "--numstat", "-M", base_sha).stdout
+    files: list[dict[str, Any]] = []
+    added = removed = 0
+    for line in numstat.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        added_str, removed_str, path = parts
+        a = int(added_str) if added_str != "-" else 0
+        r = int(removed_str) if removed_str != "-" else 0
+        if " => " in path:
+            path = _rename_destination(path)
+        files.append({"path": path, "added": a, "removed": r})
+        added += a
+        removed += r
+    return {"patch": patch, "files": files, "added": added, "removed": removed, "lines": added + removed}
+
+
+def write_patch(slug: str, task_id: str, patch: str) -> Path:
+    patch_dir = home_dir() / "repos" / slug / "patches"
     patch_dir.mkdir(parents=True, exist_ok=True)
-    patch_path = patch_dir / f"{task_id}.diff"
-    patch_path.write_text(diff, encoding="utf-8")
-    files_changed = [line.strip() for line in names.splitlines() if line.strip()]
-    return {"patchPath": str(patch_path), "filesChanged": files_changed}
+    path = patch_dir / f"{task_id}.diff"
+    path.write_text(patch, encoding="utf-8")
+    return path
 
 
-def salvage_worktree(work_dir: str, job: dict[str, Any]) -> bool:
-    """Preserve a non-succeeded task's uncommitted work so nothing is lost.
+def commit_worktree(worktree: str, message: str) -> str | None:
+    """Commit whatever is staged under a fixed monkey-army identity.
 
-    Field lesson: a worker can finish the actual work and then die (recursion
-    overrun, timeout, cancel) before committing — leaving fetch_task_result
-    empty and the salvage entirely manual. This stages everything, writes the
-    patch file (same shape as a success), and best-effort commits a WIP
-    snapshot on the monkey branch. Returns True when there was anything to
-    salvage. Never raises.
+    Returns the new commit sha, or None when there was nothing to commit
+    (not an error — a task whose only "change" was investigation, or a
+    retry that restaged an already-committed state, legitimately commits
+    nothing).
     """
     try:
-        diff = collect_diff(work_dir, job["repo"], job["worktree"], job["taskId"])
+        _git(
+            worktree,
+            "-c", "user.name=monkey-army", "-c", "user.email=monkey-army@localhost",
+            "commit", "-m", message,
+        )
+    except subprocess.CalledProcessError as e:
+        if "nothing to commit" in (e.stdout or "") + (e.stderr or ""):
+            return None
+        raise
+    return _git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+
+def salvage_worktree(job: dict[str, Any]) -> bool:
+    """Preserve a non-succeeded task's uncommitted work so nothing is lost.
+
+    Field lesson: a worker can finish the actual work and then die
+    (recursion overrun, timeout, cancel) before committing. This stages
+    everything changed, writes the patch file (same shape as a success), and
+    best-effort commits a WIP snapshot on the monkey branch. Returns True
+    when there was anything to salvage. Never raises.
+    """
+    try:
+        worktree = job["worktree"]
+        files = changed_files(worktree)
+        if not files:
+            return False
+        stage_files(worktree, files)
+        patch = _git(worktree, "diff", "--cached", "--binary").stdout
     except (subprocess.CalledProcessError, OSError, KeyError):
         return False
-    if not diff.get("filesChanged"):
-        return False
-    job.update(diff)
+    job["filesChanged"] = files
+    job["patchPath"] = str(write_patch(job["slug"], job["taskId"], patch))
     try:
-        _git(
-            job["worktree"],
-            "-c", "user.name=monkey-army",
-            "-c", "user.email=monkey-army@localhost",
-            "commit", "-m",
-            f"wip(monkey-army): salvage snapshot ({job.get('status', 'failed')})",
-        )
+        commit_worktree(worktree, f"wip(monkey-army): salvage ({job.get('status', 'failed')})")
     except subprocess.CalledProcessError:
         pass  # staged + patch file already secure the work
     return True
 
 
-def cleanup_job(work_dir: str, job: dict[str, Any], delete_branch: bool = True) -> dict[str, Any]:
-    """Remove worktree + branch + persisted file. Caller checks job is not running."""
+def cleanup_job(job: dict[str, Any], delete_branch: bool = True) -> dict[str, Any]:
+    """Remove worktree + branch + persisted file + comm dir. Caller checks
+    the job is not running."""
     result = {
         "taskId": job["taskId"],
         "worktreeRemoved": False,
@@ -184,10 +272,12 @@ def cleanup_job(work_dir: str, job: dict[str, Any], delete_branch: bool = True) 
             pass
 
     try:
-        delete_persisted_job(job, work_dir)
+        delete_persisted_job(job)
         result["persistedRemoved"] = True
     except OSError:
         pass
+
+    shutil.rmtree(repo_state_dir(job["repo"]) / "comm" / job["taskId"], ignore_errors=True)
 
     delete_job(job["taskId"])
     return result
