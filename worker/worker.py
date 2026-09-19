@@ -1,9 +1,10 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "deepagents>=0.7.0a6",
-#   "langchain-litellm",
-#   "fastapi",
+#   "deepagents==0.7.15",
+#   "langchain-litellm==0.7.2",
+#   "litellm==1.101.0",
+#   "fastapi==0.116.1",
 # ]
 # ///
 """Runs one delegated coding task with deepagents, then prints a single
@@ -19,12 +20,18 @@ Stdout is the upward channel to the server:
   job to ``needs_input``; the worker then blocks (token-free) polling the
   comm dir until answer_worker drops a reply file;
 - the final ``RESULT_JSON:`` line carries the verdict.
+
+``--selftest`` skips all of the above: it just imports the heavy deps,
+constructs a model and a backend with dummy values (no network), and prints
+``SELFTEST_OK`` — used by the server's doctor to warm the uv cache and catch
+a broken install before a real task ever starts.
 """
 
 import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -34,6 +41,7 @@ import time
 import uuid
 
 import litellm
+from langchain_litellm import ChatLiteLLM
 
 from deepagents import RubricMiddleware, SubAgent, create_deep_agent
 from deepagents.backends.local_shell import LocalShellBackend
@@ -45,20 +53,141 @@ QUESTION_MARKER = "QUESTION:"
 
 DEFAULT_COMMAND_TIMEOUT = 120
 DEFAULT_ASK_TIMEOUT = 600
+DEFAULT_RECURSION_LIMIT_MICRO = 80
+DEFAULT_RECURSION_LIMIT_TASK = 400
 
 # Whole-drive scans (`find /`, `find C:/`) once froze a delegation for 20+
 # minutes. The per-command timeout now bounds the damage, but there is never
 # a reason to leave the worktree — refuse outright and tell the model why.
 _DRIVE_SCAN_RE = re.compile(r"""\bfind\s+['"]?(?:/|[A-Za-z]:[/\\]?)['"]?(?:\s|$)""")
 
-# The system prompt already tells the worker never to push/merge/rebase — this
-# is that rule ENFORCED at the tool level instead of trusted on the model's
-# word, since a worker only ever operates on its own disposable branch and
-# there is never a legitimate reason for it to touch shared history itself.
-# `(?=\s|$)` (not `\b`) so read-only lookalikes like `git merge-base` or
-# `git log --merges` aren't caught — `\b` alone matches between "merge" and
-# the hyphen in "merge-base" too, which would wrongly block it.
-_DANGEROUS_GIT_RE = re.compile(r"""\bgit\s+(push|merge|rebase)(?=\s|$)""", re.IGNORECASE)
+
+# ── Git allowlist (tool-level enforcement) ──────────────────────────────────
+# The system prompt already tells the worker never to push/merge/rebase —
+# git_command_allowed enforces that at the tool layer instead of trusting the
+# model's word, since a worker only ever operates on its own disposable
+# branch and there is never a legitimate reason for it to touch shared
+# history. Default is deny: only an explicit allowlist of inspection/local
+# git subcommands passes; everything else, known or not, is blocked.
+_GIT_SEPARATORS = {"&&", "||", ";", "|"}
+_GIT_GLOBAL_OPTS_WITH_ARG = {"-C", "-c"}
+_GIT_GLOBAL_OPTS_NO_ARG = {"--no-pager", "-p", "--paginate"}
+_GIT_GLOBAL_OPTS_INLINE = ("--git-dir=", "--work-tree=", "--exec-path=", "--namespace=")
+
+_GIT_ALLOWED_SUBCOMMANDS = {
+    "status", "diff", "log", "show", "add", "blame", "grep", "ls-files",
+    "rev-parse", "apply", "rm", "mv", "restore", "commit", "merge-base",
+}
+_GIT_BRANCH_SAFE_ARGS = {"--show-current", "--list", "-a"}
+_GIT_RESET_DANGEROUS_ARGS = {"--hard", "--merge", "--keep"}
+
+_GIT_BLOCKED_MSG = (
+    "git {sub} is blocked for workers: you operate on a disposable branch; the supervisor "
+    "reviews and merges."
+)
+
+
+def _tokenize_shell(command: str) -> list[str] | None:
+    """POSIX-ish tokenizer that also splits ``&&``/``||``/``;``/``|`` when
+    glued to a neighbouring word.
+
+    Plain ``shlex.split`` leaves ``git status;git push`` as a single token
+    ``"status;git"`` (no whitespace around the ``;``), which would hide the
+    chained ``git push`` from the allowlist check below. ``shlex.shlex`` with
+    ``punctuation_chars=True`` treats those operator characters as their own
+    tokens even without surrounding whitespace, while still respecting
+    quoting (``sh -c "git push"`` stays a single quoted token).
+    """
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _split_on_separators(tokens: list[str]) -> list[list[str]]:
+    commands: list[list[str]] = []
+    current: list[str] = []
+    for tok in tokens:
+        if tok in _GIT_SEPARATORS:
+            if current:
+                commands.append(current)
+            current = []
+        else:
+            current.append(tok)
+    if current:
+        commands.append(current)
+    return commands
+
+
+def _git_subcommand_index(tokens: list[str]) -> int | None:
+    """Index of the first token after ``git`` that isn't a global option."""
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _GIT_GLOBAL_OPTS_WITH_ARG:
+            i += 2
+        elif tok in _GIT_GLOBAL_OPTS_NO_ARG or tok.startswith(_GIT_GLOBAL_OPTS_INLINE):
+            i += 1
+        else:
+            return i
+    return None
+
+
+def _git_subcommand_allowed(sub: str, rest: list[str]) -> bool:
+    if sub == "branch":
+        # No args (plain listing) or only read-only flags — never a rename/delete.
+        return all(tok in _GIT_BRANCH_SAFE_ARGS for tok in rest)
+    if sub == "reset":
+        # Soft/mixed resets touch only the index and HEAD; --hard/--merge/--keep
+        # can discard working-tree changes, which is not this tool's call to make.
+        return not any(tok in _GIT_RESET_DANGEROUS_ARGS for tok in rest)
+    return sub in _GIT_ALLOWED_SUBCOMMANDS
+
+
+def git_command_allowed(command: str) -> tuple[bool, str]:
+    """Return ``(allowed, reason)`` for a shell command that may invoke git.
+
+    Every ``git`` invocation anywhere in the command line — including chained
+    via ``&&``/``||``/``;``/``|`` and nested inside ``sh -c "..."``/``bash -c
+    "..."`` — must resolve to an allowlisted subcommand. Non-git commands
+    always pass. A command that can't be tokenized is blocked outright: we
+    can't rule out a hidden git call inside it.
+    """
+    tokens = _tokenize_shell(command)
+    if tokens is None:
+        return False, "could not parse command"
+
+    for simple in _split_on_separators(tokens):
+        if not simple:
+            continue
+        # Any quoted/substituted argument that itself contains a git call
+        # (`sh -lc "git push"`, `echo $(git push)`, `xargs sh -c '...'`) is
+        # checked as its own command line.
+        for arg in simple[1:]:
+            if "git" in arg and any(c.isspace() or c in "$`;|&" for c in arg):
+                ok, msg = git_command_allowed(arg.replace("$(", " ").replace("`", " ").replace(")", " "))
+                if not ok:
+                    return ok, msg
+
+        # Wrappers (`env git`, `xargs git`, `nohup git`, `command git`) put
+        # git after the first token; start from the first git token instead.
+        git_at = next(
+            (i for i, t in enumerate(simple) if t == "git" or t.endswith("/git")), None
+        )
+        if git_at is None:
+            continue
+        simple = simple[git_at:]
+
+        idx = _git_subcommand_index(simple)
+        if idx is None:
+            continue
+        sub = simple[idx]
+        if not _git_subcommand_allowed(sub, simple[idx + 1:]):
+            return False, _GIT_BLOCKED_MSG.format(sub=sub)
+
+    return True, ""
 
 
 def emit_progress(payload: dict) -> None:
@@ -111,7 +240,7 @@ def _find_bash() -> str | None:
 
 
 class SupervisedShellBackend(LocalShellBackend):
-    """LocalShellBackend with three field-tested hardenings:
+    """LocalShellBackend with field-tested hardenings:
 
     1. **Command-start announcements** — every command is echoed as a
        ``PROGRESS:`` line before it runs, so the dashboard and
@@ -125,6 +254,8 @@ class SupervisedShellBackend(LocalShellBackend):
     3. **bash routing on Windows** — each command is written to a temp
        script and run via ``[bash, script]`` (no cmd.exe, no quoting
        conflicts). Elsewhere the default shell is already sh-compatible.
+    4. **Git allowlist** — every command is checked with
+       ``git_command_allowed`` before it runs.
     """
 
     def __init__(self, *args, bash_path: str | None = None, **kwargs) -> None:
@@ -146,15 +277,9 @@ class SupervisedShellBackend(LocalShellBackend):
                 exit_code=1,
                 truncated=False,
             )
-        if _DANGEROUS_GIT_RE.search(command):
-            return ExecuteResponse(
-                output=(
-                    "Error: git push/merge/rebase are blocked for the worker. Finish your changes "
-                    "on this branch and stop — the supervisor reviews and merges."
-                ),
-                exit_code=1,
-                truncated=False,
-            )
+        allowed, reason = git_command_allowed(command)
+        if not allowed:
+            return ExecuteResponse(output=f"Error: {reason}", exit_code=1, truncated=False)
 
         effective_timeout = timeout if timeout is not None else self._default_timeout
         emit_progress({
@@ -386,7 +511,8 @@ def is_sensitive_env_name(name: str) -> bool:
     API_KEY / APIKEY / TOKEN / SECRET / PASSWORD / CREDENTIAL qualifies. We
     err on the side of dropping more variables rather than risking a leak
     through a shell command the agent runs. PATH / HOME / SystemRoot / TEMP
-    are unaffected.
+    are unaffected, and so are GIT_CONFIG_* / GIT_TERMINAL_PROMPT — those
+    carry the launcher's remote-neutralisation block and must reach `git`.
     """
     upper = name.upper()
     return any(token in upper for token in _SENSITIVE_ENV_SUBSTRINGS)
@@ -399,7 +525,8 @@ def build_shell_env(api_key_env_var: str) -> dict[str, str]:
     secret names ``MONKEY_WORKER_API_KEY`` and the provider-specific key env
     var named by ``api_key_env_var``. PATH, HOME, SystemRoot, TEMP, and
     similar survive so that ``git``, ``node``, ``npm``, etc. keep working
-    inside the worktree.
+    inside the worktree — as do ``GIT_CONFIG_*``/``GIT_TERMINAL_PROMPT``, which
+    the launcher sets to neutralise remotes and are not secrets.
 
     IMPORTANT: this only filters the dict we hand to the shell backend — the
     Python process's own ``os.environ`` keeps the provider key, because
@@ -413,46 +540,90 @@ def build_shell_env(api_key_env_var: str) -> dict[str, str]:
     }
 
 
+def _usage_value(usage, name: str):
+    if hasattr(usage, name):
+        return getattr(usage, name)
+    if isinstance(usage, dict):
+        return usage.get(name)
+    return None
+
+
 class CostTracker:
     """litellm success callback that accumulates cost + tokens across every
     model call in the run (main agent, subagents, rubric grader).
 
-    Per-call failures degrade silently: a model without a known price simply
-    contributes nothing to ``cost_usd`` but does not crash the agent loop.
+    litellm has no pricing entry for most 9Router ``combo/*`` ids, so on top
+    of ``litellm.completion_cost`` this falls back to the profile's flat
+    per-token prices (``price_in``/``price_out``, USD per 1M tokens) whenever
+    a call comes back unpriced — the budget loop and RESULT_JSON then still
+    report a real number instead of silently staying at zero.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, price_in: float | None, price_out: float | None,
+                 max_tokens_total: int | None) -> None:
+        self.price_in = price_in
+        self.price_out = price_out
+        self.max_tokens_total = max_tokens_total
         self.cost_usd: float = 0.0
         self.total_tokens: int = 0
+        self.prompt_tokens: int = 0
+        self.completion_tokens: int = 0
         self._priced_calls: int = 0
+        self._models_seen: dict[str, None] = {}  # insertion-ordered set
 
     def __call__(self, kwargs, completion_response, start_time, end_time) -> None:  # noqa: ARG002
-        # Per-call cost lookup — wrapped because unknown model pricing raises
-        # in litellm; a metering failure must never crash the agent.
+        priced_this_call = False
         try:
             cost = litellm.completion_cost(completion_response=completion_response)
             if cost is not None and isinstance(cost, (int, float)) and float(cost) >= 0:
                 self.cost_usd += float(cost)
-                self._priced_calls += 1
+                priced_this_call = True
         except Exception:
-            # Unknown model / missing pricing entry — skip silently.
+            # Unknown model / missing pricing entry — try the fallback below.
             pass
 
-        # Token accumulation — try the attribute, then the dict, then give up.
+        prompt_tok = completion_tok = total_tok = 0
         try:
             usage = getattr(completion_response, "usage", None)
             if usage is None and isinstance(completion_response, dict):
                 usage = completion_response.get("usage")
-            total: object | None = None
             if usage is not None:
-                if hasattr(usage, "total_tokens"):
-                    total = usage.total_tokens
-                elif isinstance(usage, dict):
-                    total = usage.get("total_tokens")
-            if isinstance(total, (int, float)):
-                self.total_tokens += int(total)
+                prompt_tok = int(_usage_value(usage, "prompt_tokens") or 0)
+                completion_tok = int(_usage_value(usage, "completion_tokens") or 0)
+                total_tok = int(_usage_value(usage, "total_tokens") or (prompt_tok + completion_tok))
         except Exception:
             pass
+
+        if not priced_this_call and total_tok and (self.price_in is not None or self.price_out is not None):
+            self.cost_usd += (
+                prompt_tok * (self.price_in or 0.0) / 1e6
+                + completion_tok * (self.price_out or 0.0) / 1e6
+            )
+            priced_this_call = True
+
+        if priced_this_call:
+            self._priced_calls += 1
+        self.prompt_tokens += prompt_tok
+        self.completion_tokens += completion_tok
+        self.total_tokens += total_tok
+
+        model_name = None
+        try:
+            model_name = getattr(completion_response, "model", None)
+            if model_name is None and isinstance(completion_response, dict):
+                model_name = completion_response.get("model")
+        except Exception:
+            pass
+        if isinstance(model_name, str) and model_name:
+            self._models_seen.setdefault(model_name, None)
+
+    @property
+    def priced(self) -> bool:
+        return self._priced_calls > 0
+
+    @property
+    def models_seen(self) -> list[str]:
+        return list(self._models_seen)
 
     def final_cost_usd(self) -> float | None:
         """Return the accumulated cost, or ``None`` if no call could be priced."""
@@ -490,6 +661,30 @@ SUBAGENTS: list[SubAgent] = [
     },
 ]
 
+
+def _subagents_with_model(subagents: list[SubAgent], model: ChatLiteLLM) -> list[SubAgent]:
+    """Task mode only: pin every subagent to the same model instance as the
+    main agent and the rubric grader, so all three share one provider config."""
+    out = []
+    for sa in subagents:
+        sa = dict(sa)
+        sa["model"] = model
+        out.append(sa)
+    return out
+
+
+MICRO_SYSTEM_PROMPT = (
+    "You are a coding worker executing one small, fully specified task from a supervisor. Read the "
+    "\"Read first\" files, then make the minimal change described, touching only the allowed files. "
+    "Use relative paths. Run the acceptance command; if it fails, fix your change and rerun; when "
+    "it exits 0, write a summary of at most 3 sentences and STOP. Do not refactor, rename, "
+    "reformat, add features, or edit files outside the allowed list. Never use git for anything "
+    "except status/diff/log/add/commit-free inspection; never push, fetch, merge, rebase, stash, "
+    "or change branches. If the spec is ambiguous or you have failed the same way three times, call "
+    "ask_supervisor or report_blocker instead of guessing. If a tool output ends with a line starting "
+    "\"⚠ SUPERVISOR STEERING\", obey it immediately."
+)
+
 SYSTEM_PROMPT = (
     "You are an autonomous coding worker delegated by a supervisor. "
     "Work only inside the current working directory; never scan the filesystem or drive root "
@@ -509,14 +704,16 @@ SYSTEM_PROMPT = (
     "and STOP — do not keep re-verifying. The supervisor reviews and merges."
 )
 
-
-def build_prompt(spec: str, definition_of_done: str | None, test_command: str | None) -> str:
-    parts = ["# Task", spec]
-    if definition_of_done:
-        parts.append(f"\n# Definition of done\n{definition_of_done}")
-    if test_command:
-        parts.append(f"\n# Test command\nRun `{test_command}` and iterate until it passes.")
-    return "\n".join(parts)
+# Task mode's addition to SYSTEM_PROMPT: the model-facing counterpart of the
+# git_command_allowed enforcement above, so a blocked command reads as an
+# expected constraint instead of a mysterious tool failure.
+_TASK_GIT_ALLOWLIST_SENTENCE = (
+    "Git is restricted to inspection and local-only work — status, diff, log, show, add, blame, "
+    "grep, ls-files, rev-parse, apply, rm, mv, restore, safe branch/reset forms, merge-base, and "
+    "commit; every other subcommand (push, fetch, pull, merge, rebase, stash, tag, remote, "
+    "checkout, switch, and the rest) is blocked at the tool layer, not just discouraged here."
+)
+TASK_SYSTEM_PROMPT = SYSTEM_PROMPT + " " + _TASK_GIT_ALLOWLIST_SENTENCE
 
 
 def _message_content(message) -> object | None:
@@ -557,59 +754,129 @@ def _last_message_content(messages: list) -> object | None:
 
 
 def _bare_model(model_str: str) -> str:
-    """Strip the langchain '<provider-prefix>:' convention litellm doesn't use.
+    """Strip the legacy langchain ``'<provider-prefix>:'`` convention.
 
     ``"litellm:openai/combo-deepseek-main"`` -> ``"openai/combo-deepseek-main"``.
-    Matches the convention already used by ``statusline_render.pretty_model``
-    server-side.
+    This is NOT the litellm provider prefix (``openai/``, ``deepseek/``, ...) —
+    that one stays, litellm needs it to pick the adapter. This only strips the
+    old colon-separated convention some stored profiles still use.
     """
     return model_str.split(":", 1)[-1] if ":" in model_str else model_str
 
 
-def build_model(model_str: str, fallback_models: list[str] | None):
-    """Return what to hand create_deep_agent's ``model=`` argument.
+def build_model(
+    model: str,
+    api_base: str | None,
+    api_key: str | None,
+    fallback_models: list[str],
+    model_kwargs: dict,
+) -> ChatLiteLLM:
+    """Always return a ChatLiteLLM instance (never a bare string).
 
-    With no fallbacks configured (the default, common case), this is just the
-    bare model STRING — unchanged behavior, resolved by deepagents' own
-    ``init_chat_model``. With fallbacks, construct a ``ChatLiteLLM`` instance
-    directly instead: ``model_kwargs`` is spread verbatim into every
-    ``litellm.completion(...)`` call, and litellm's own ``fallbacks`` kwarg
-    triggers ``completion_with_fallbacks`` — tried in order if the primary
-    model's call fails. Bypassing deepagents' string-based resolution is the
-    only way to reach this litellm-level parameter.
+    ``model`` keeps its full litellm form including the provider prefix
+    (e.g. ``"openai/combo/deepseek-main"``) — litellm uses that prefix to
+    pick the adapter; only the legacy ``xxx:`` convention is stripped by
+    ``_bare_model``. The same instance this returns is handed to
+    create_deep_agent, RubricMiddleware, and every task-mode subagent, so
+    they all share one provider config.
     """
-    if not fallback_models:
-        return model_str
-    from langchain_litellm import ChatLiteLLM
-
+    kwargs = dict(model_kwargs) if model_kwargs else {}
+    if fallback_models:
+        kwargs["fallbacks"] = list(fallback_models)
     return ChatLiteLLM(
-        model=_bare_model(model_str),
-        model_kwargs={"fallbacks": [_bare_model(fm) for fm in fallback_models]},
+        model=_bare_model(model),
+        api_base=api_base,
+        api_key=api_key,
+        model_kwargs=kwargs,
     )
+
+
+def _opt(v: str | None) -> str | None:
+    """CLI convention: an explicit empty string means "unset"."""
+    return v if v else None
+
+
+def _opt_float(v: str) -> float | None:
+    v = _opt(v)
+    return float(v) if v is not None else None
+
+
+def _opt_int(v: str) -> int | None:
+    v = _opt(v)
+    return int(v) if v is not None else None
+
+
+def _opt_csv(v: str) -> list[str]:
+    v = _opt(v)
+    return [item.strip() for item in v.split(",") if item.strip()] if v else []
+
+
+def _opt_json(v: str) -> dict:
+    v = _opt(v)
+    return json.loads(v) if v else {}
+
+
+def run_selftest() -> int:
+    """Import everything, construct a model and a backend with dummy values,
+    make NO network call, print SELFTEST_OK. Used by the server's doctor to
+    warm the uv cache and catch a broken install before a real task runs.
+    """
+    try:
+        import fastapi  # noqa: F401  # pinned only for RubricMiddleware's lazy import; verify it resolves here
+
+        build_model("openai/combo/selftest-dummy", None, "dummy-key", [], {})
+        with tempfile.TemporaryDirectory() as tmp:
+            SupervisedShellBackend(root_dir=tmp, virtual_mode=True, timeout=5, inherit_env=False, env={})
+    except Exception as e:  # noqa: BLE001 - report and exit non-zero, don't crash with a traceback
+        print(f"SELFTEST_FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    print("SELFTEST_OK")
+    return 0
 
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--worktree", required=True)
-    p.add_argument("--spec", required=True)
-    p.add_argument("--definition-of-done", default=None)
-    p.add_argument("--test-command", default=None)
+    p.add_argument("--worktree", default=None)
+    p.add_argument("--brief", default=None)
     p.add_argument("--model", default="openai/combo/deepseek-main")
+    p.add_argument("--api-base", type=_opt, default=None)
     p.add_argument("--api-key-env-var", default="MONKEY_9ROUTER_KEY",
                     help="Provider-specific env var litellm expects for --model's provider prefix.")
-    p.add_argument("--recursion-limit", type=int, default=400)
+    p.add_argument("--fallback-models", type=_opt_csv, default=[],
+                    help="Comma-separated litellm model strings tried in order via litellm's own "
+                         "fallback mechanism if the primary model's call fails.")
+    p.add_argument("--model-kwargs-json", type=_opt_json, default={},
+                    help="JSON object spread into model_kwargs (e.g. temperature).")
+    p.add_argument("--price-in", type=_opt_float, default=None)
+    p.add_argument("--price-out", type=_opt_float, default=None)
+    p.add_argument("--max-budget-usd", type=_opt_float, default=None,
+                    help="Stop and report once accumulated cost_usd crosses this cap.")
+    p.add_argument("--max-tokens-total", type=_opt_int, default=None,
+                    help="Stop and report once accumulated total_tokens crosses this cap — works "
+                         "even when the model has no known price.")
+    p.add_argument("--mode", choices=["micro", "task"], default="task")
+    p.add_argument("--recursion-limit", type=_opt_int, default=None,
+                    help="Defaults to 80 in micro mode, 400 in task mode.")
     p.add_argument("--rubric-max-iterations", type=int, default=6)
     p.add_argument("--command-timeout", type=int, default=DEFAULT_COMMAND_TIMEOUT,
                     help="Per-shell-command timeout in seconds (whole process tree killed on expiry).")
-    p.add_argument("--fallback-models", default=None,
-                    help="Comma-separated litellm model strings (same 'provider:model' convention "
-                         "as --model) tried in order via litellm's own fallback mechanism if the "
-                         "primary model's call fails.")
-    p.add_argument("--max-budget-usd", type=float, default=None,
-                    help="Stop and report once accumulated cost_usd crosses this cap, instead of "
-                         "running unbounded.")
+    p.add_argument("--allowed-files", type=_opt_csv, default=[],
+                    help="Informational only — scope is enforced server-side; the brief already "
+                         "lists these for the model.")
+    p.add_argument("--test-command", type=_opt, default=None)
+    p.add_argument("--definition-of-done", type=_opt, default=None)
+    p.add_argument("--selftest", action="store_true")
     args = p.parse_args()
-    fallback_models = [m.strip() for m in args.fallback_models.split(",") if m.strip()] if args.fallback_models else None
+
+    if args.selftest:
+        return run_selftest()
+
+    if not args.worktree or not args.brief:
+        p.error("--worktree and --brief are required unless --selftest is given")
+
+    recursion_limit = args.recursion_limit
+    if recursion_limit is None:
+        recursion_limit = DEFAULT_RECURSION_LIMIT_MICRO if args.mode == "micro" else DEFAULT_RECURSION_LIMIT_TASK
 
     # MONKEY_WORKER_API_KEY is optional: a keyless profile runs on whatever
     # default auth the target endpoint expects.
@@ -619,9 +886,9 @@ def main() -> int:
 
     # Filter the env before handing it to the shell backend so the agent can't
     # echo host secrets (MONKEY_WORKER_API_KEY, the provider key, GITHUB_TOKEN, ...)
-    # back through a shell command. PATH / HOME / SystemRoot / TEMP survive so
-    # node/npm/git still work. The Python process's own os.environ keeps the
-    # provider key — litellm reads it from there.
+    # back through a shell command. PATH / HOME / SystemRoot / TEMP / GIT_CONFIG_*
+    # survive so git/node/npm still work. The Python process's own os.environ
+    # keeps the provider key — litellm reads it from there.
     shell_env = build_shell_env(args.api_key_env_var)
     backend = SupervisedShellBackend(
         root_dir=args.worktree,
@@ -635,35 +902,53 @@ def main() -> int:
     # Register a litellm success callback to meter cost + tokens across every
     # model call in the run (main agent, subagents, rubric grader). Registered
     # BEFORE create_deep_agent so the first model call is metered too.
-    tracker = CostTracker()
+    tracker = CostTracker(args.price_in, args.price_out, args.max_tokens_total)
     litellm.success_callback = [tracker]
+
+    model = build_model(args.model, args.api_base, api_key, args.fallback_models, args.model_kwargs_json)
 
     # _rubric_status is a PrivateStateAttr, omitted from stream()'s final state
     # by design; on_evaluation is the documented way to observe the grader's
     # verdict without a checkpointer.
     rubric_evaluations: list[dict] = []
-    model = build_model(args.model, fallback_models)
+    middleware = []
+    subagents = None
+    if args.mode == "task":
+        subagents = _subagents_with_model(SUBAGENTS, model)
+        middleware.append(RubricMiddleware(
+            model=model,
+            max_iterations=args.rubric_max_iterations,
+            on_evaluation=rubric_evaluations.append,
+        ))
+        system_prompt = TASK_SYSTEM_PROMPT
+    else:
+        system_prompt = MICRO_SYSTEM_PROMPT
+
     agent = create_deep_agent(
         model=model,
         tools=[report_progress, ask_supervisor, report_blocker],
         backend=backend,
-        system_prompt=SYSTEM_PROMPT,
-        subagents=SUBAGENTS,
-        middleware=[RubricMiddleware(
-            model=args.model,
-            max_iterations=args.rubric_max_iterations,
-            on_evaluation=rubric_evaluations.append,
-        )],
+        system_prompt=system_prompt,
+        subagents=subagents,
+        middleware=middleware,
     )
 
-    prompt = build_prompt(args.spec, args.definition_of_done, args.test_command)
-    rubric = args.definition_of_done or (f"Running `{args.test_command}` succeeds." if args.test_command else None)
+    with open(args.brief, encoding="utf-8") as f:
+        prompt = f.read()
+
+    # Rubric only applies in task mode — micro mode has no RubricMiddleware
+    # installed and its status is decided by "did the agent stop without error".
+    rubric = None
+    if args.mode == "task":
+        rubric = args.definition_of_done or (
+            f"Running `{args.test_command}` succeeds." if args.test_command else None
+        )
 
     invoke_state = {"messages": [{"role": "user", "content": prompt}]}
     if rubric:
         invoke_state["rubric"] = rubric
 
-    result = {
+    result: dict[str, object] = {
         "status": "failed",
         "summary": None,
         "turns": 0,
@@ -671,6 +956,10 @@ def main() -> int:
         "rubric_status": None,
         "cost_usd": None,
         "total_tokens": None,
+        "priced": False,
+        "models_seen": [],
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
     }
     try:
         # Live progress: stream updates one node at a time, print a flushed
@@ -681,9 +970,10 @@ def main() -> int:
         step_counter = 0
         accumulated_messages: list = []
         budget_exceeded = False
+        budget_reason = ""
         for update in agent.stream(
             invoke_state,
-            config={"recursion_limit": args.recursion_limit},
+            config={"recursion_limit": recursion_limit},
             stream_mode="updates",
         ):
             for node_name, node_state in update.items():
@@ -705,15 +995,22 @@ def main() -> int:
                     payload["note"] = note
                 emit_progress(payload)
 
-                # Stop as soon as accumulated spend crosses the cap, rather
-                # than running unbounded — checked after every step so the
-                # overrun is at most one model call past the cap.
-                if args.max_budget_usd is not None and tracker.cost_usd > args.max_budget_usd:
+                # Stop as soon as either cap is crossed, rather than running
+                # unbounded — checked after every step so the overrun is at
+                # most one model call past the cap. The token cap works even
+                # when the model has no known price (cost stays 0/unpriced).
+                over_budget = args.max_budget_usd is not None and tracker.cost_usd > args.max_budget_usd
+                over_tokens = (
+                    args.max_tokens_total is not None and tracker.total_tokens > args.max_tokens_total
+                )
+                if over_budget or over_tokens:
                     budget_exceeded = True
-                    emit_progress({
-                        "kind": "report",
-                        "note": f"budget exceeded: ${tracker.cost_usd:.4f} > cap ${args.max_budget_usd:.2f}; stopping",
-                    })
+                    budget_reason = (
+                        f"cost ${tracker.cost_usd:.4f} crossed the ${args.max_budget_usd:.2f} USD cap"
+                        if over_budget
+                        else f"{tracker.total_tokens} tokens crossed the {args.max_tokens_total} token cap"
+                    )
+                    emit_progress({"kind": "report", "note": f"budget exceeded: {budget_reason}; stopping"})
                     break
             if budget_exceeded:
                 break
@@ -724,10 +1021,9 @@ def main() -> int:
         result["rubric_status"] = rubric_evaluations[-1]["result"] if rubric_evaluations else None
         if budget_exceeded:
             result["status"] = "failed"
-            result["error"] = (
-                f"budget exceeded: cost so far ${tracker.cost_usd:.4f} crossed the "
-                f"${args.max_budget_usd:.2f} cap; stopped early instead of running unbounded"
-            )
+            result["error"] = f"budget exceeded: {budget_reason}; stopped early instead of running unbounded"
+        elif args.mode == "micro":
+            result["status"] = "succeeded"
         elif rubric:
             result["status"] = "succeeded" if result["rubric_status"] == "satisfied" else "failed"
             if result["status"] == "failed":
@@ -741,6 +1037,10 @@ def main() -> int:
     # can still report partial spend on crashed runs.
     result["cost_usd"] = tracker.final_cost_usd()
     result["total_tokens"] = tracker.total_tokens if tracker.total_tokens > 0 else None
+    result["priced"] = tracker.priced
+    result["models_seen"] = tracker.models_seen
+    result["prompt_tokens"] = tracker.prompt_tokens
+    result["completion_tokens"] = tracker.completion_tokens
 
     print(RESULT_MARKER + json.dumps(result))
     return 0 if result["status"] == "succeeded" else 1

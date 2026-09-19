@@ -1,14 +1,15 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "deepagents>=0.7.0a6",
-#   "langchain-litellm",
-#   "fastapi",
+#   "deepagents==0.7.15",
+#   "langchain-litellm==0.7.2",
+#   "litellm==1.101.0",
+#   "fastapi==0.116.1",
 # ]
 # ///
-"""Unit tests for worker.py's pure/isolable helpers: build_model (fallback
-chains), the dangerous-git command guard, the drive-scan guard, and the
-proactive steering mailbox (check_steer_message / _append_steer_notice).
+"""Unit tests for worker.py's pure/isolable helpers: build_model,
+git_command_allowed, the drive-scan guard, CostTracker, build_shell_env, and
+the proactive steering mailbox (check_steer_message / _append_steer_notice).
 
 Not part of server/'s stdlib-only suite (worker.py needs the heavy deepagents
 + litellm stack) — run directly: `uv run worker/tests/test_worker.py`.
@@ -19,6 +20,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -26,54 +28,138 @@ import worker
 
 
 class TestBuildModel(unittest.TestCase):
-    def test_no_fallbacks_returns_bare_string_unchanged(self):
-        self.assertEqual(
-            worker.build_model("litellm:openai/combo-deepseek-main", None),
-            "litellm:openai/combo-deepseek-main",
-        )
-
-    def test_empty_fallback_list_returns_bare_string_unchanged(self):
-        self.assertEqual(
-            worker.build_model("litellm:openai/combo-deepseek-main", []),
-            "litellm:openai/combo-deepseek-main",
-        )
-
-    def test_fallbacks_build_a_chatlitellm_instance(self):
-        model = worker.build_model(
-            "litellm:openai/combo-deepseek-main",
-            ["litellm:openai/combo-fallback", "litellm:anthropic/claude-haiku-4-5"],
-        )
+    def test_sets_model_api_base_api_key(self):
+        model = worker.build_model("openai/combo/deepseek-main", "http://9router.local/v1", "sk-abc", [], {})
         from langchain_litellm import ChatLiteLLM
 
         self.assertIsInstance(model, ChatLiteLLM)
-        self.assertEqual(model.model, "openai/combo-deepseek-main")
+        # Full litellm string including the provider prefix — NOT stripped.
+        self.assertEqual(model.model, "openai/combo/deepseek-main")
+        self.assertEqual(model.api_base, "http://9router.local/v1")
+        self.assertEqual(model.api_key, "sk-abc")
+
+    def test_model_kwargs_carries_profile_kwargs_and_fallbacks(self):
+        model = worker.build_model(
+            "openai/combo/deepseek-main", None, None,
+            ["openai/combo/fallback", "anthropic/claude-haiku-4-5"],
+            {"temperature": 0},
+        )
+        self.assertEqual(model.model_kwargs["temperature"], 0)
         self.assertEqual(
             model.model_kwargs["fallbacks"],
-            ["openai/combo-fallback", "anthropic/claude-haiku-4-5"],
+            ["openai/combo/fallback", "anthropic/claude-haiku-4-5"],
         )
 
-    def test_bare_model_strips_provider_prefix_only_once(self):
+    def test_no_fallbacks_means_no_fallbacks_key(self):
+        model = worker.build_model("openai/combo/deepseek-main", None, None, [], {"temperature": 0.2})
+        self.assertNotIn("fallbacks", model.model_kwargs)
+        self.assertEqual(model.model_kwargs, {"temperature": 0.2})
+
+    def test_bare_model_strips_legacy_colon_prefix_only(self):
         self.assertEqual(worker._bare_model("litellm:openai/combo-deepseek-main"), "openai/combo-deepseek-main")
         self.assertEqual(worker._bare_model("no-prefix-model"), "no-prefix-model")
+        # The litellm provider prefix (before the FIRST slash) is never touched.
+        self.assertEqual(worker._bare_model("openai/combo/deepseek-main"), "openai/combo/deepseek-main")
 
 
-class TestDangerousGitGuard(unittest.TestCase):
-    def _blocked(self, cmd: str) -> bool:
-        return bool(worker._DANGEROUS_GIT_RE.search(cmd))
+class TestGitCommandAllowed(unittest.TestCase):
+    def _allowed(self, cmd: str) -> bool:
+        ok, _ = worker.git_command_allowed(cmd)
+        return ok
 
-    def test_blocks_push_merge_rebase(self):
-        self.assertTrue(self._blocked("git push origin main"))
-        self.assertTrue(self._blocked("git merge feature-branch"))
-        self.assertTrue(self._blocked("git rebase -i HEAD~3"))
-        self.assertTrue(self._blocked("GIT PUSH origin main"))  # case-insensitive
+    def test_allowed_commands(self):
+        for cmd in [
+            "git status",
+            "git diff",
+            "git log --merges",
+            "git show HEAD",
+            "git add file.py",
+            "git blame file.py",
+            "git grep TODO",
+            "git ls-files",
+            "git rev-parse HEAD",
+            "git apply patch.diff",
+            "git rm file.py",
+            "git mv a.py b.py",
+            "git restore file.py",
+            "git commit -m 'msg'",
+            "git merge-base A B",
+            "git branch",
+            "git branch --show-current",
+            "git branch --list",
+            "git branch -a",
+            "git reset",
+            "git reset --soft HEAD~1",
+            "git reset file.py",
+            "echo hi",
+            "ls -la",
+        ]:
+            self.assertTrue(self._allowed(cmd), cmd)
 
-    def test_does_not_block_readonly_lookalikes(self):
-        self.assertFalse(self._blocked("git merge-base HEAD main"))
-        self.assertFalse(self._blocked("git log --merges"))
-        self.assertFalse(self._blocked("git status"))
-        self.assertFalse(self._blocked("echo merge"))
+    def test_blocked_commands(self):
+        for cmd in [
+            "git push origin main",
+            "git fetch",
+            "git pull",
+            "git merge feature",
+            "git rebase -i HEAD~3",
+            "git stash",
+            "git tag v1",
+            "git remote add x y",
+            "git checkout main",
+            "git switch main",
+            "git worktree add ../x",
+            "git branch -D main",
+            "git branch new-branch",
+            "git reset --hard",
+            "git reset --merge",
+            "git reset --keep",
+        ]:
+            self.assertFalse(self._allowed(cmd), cmd)
 
-    def test_backend_execute_rejects_dangerous_git(self):
+    def test_global_options_are_skipped(self):
+        self.assertFalse(self._allowed("git -C . push"))
+        self.assertFalse(self._allowed("git -c a=b push"))
+        self.assertTrue(self._allowed("git -C . status"))
+        self.assertTrue(self._allowed("git --no-pager log"))
+
+    def test_sh_and_bash_recursion(self):
+        self.assertFalse(self._allowed('sh -c "git push"'))
+        self.assertFalse(self._allowed("bash -c 'git push origin main'"))
+        self.assertTrue(self._allowed('sh -c "git status"'))
+        # Wrappers, combined flags and substitutions.
+        self.assertFalse(self._allowed('sh -lc "git push"'))
+        self.assertFalse(self._allowed("env GIT_DIR=x git push"))
+        self.assertFalse(self._allowed("echo $(git push)"))
+        self.assertFalse(self._allowed("xargs git fetch"))
+        self.assertTrue(self._allowed("env git status"))
+
+    def test_chained_commands_glued_or_spaced(self):
+        # shlex.split alone would leave "status;git" as one token — the
+        # punctuation-aware tokenizer must still catch the chained push.
+        self.assertFalse(self._allowed("git status;git push"))
+        self.assertFalse(self._allowed("git status && git push"))
+        self.assertFalse(self._allowed("git status || git push"))
+        self.assertFalse(self._allowed("git status | git push"))
+        self.assertTrue(self._allowed("git status && git diff"))
+
+    def test_unparseable_command_is_blocked(self):
+        ok, reason = worker.git_command_allowed("echo 'unterminated")
+        self.assertFalse(ok)
+        self.assertIn("could not parse", reason)
+
+    def test_blocked_message_text(self):
+        ok, reason = worker.git_command_allowed("git push origin main")
+        self.assertFalse(ok)
+        self.assertEqual(
+            reason,
+            "git push is blocked for workers: you operate on a disposable branch; the supervisor "
+            "reviews and merges.",
+        )
+
+
+class TestDriveScanGuard(unittest.TestCase):
+    def test_backend_execute_rejects_drive_scan_and_dangerous_git(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,8 +170,78 @@ class TestDangerousGitGuard(unittest.TestCase):
             self.assertEqual(result.exit_code, 1)
             self.assertIn("blocked", result.output)
 
+            result = backend.execute("find / -name secret")
+            self.assertEqual(result.exit_code, 1)
+            self.assertIn("drive root", result.output)
+
             ok = backend.execute("echo hi")
             self.assertEqual(ok.exit_code, 0)
+
+
+class TestBuildShellEnv(unittest.TestCase):
+    def setUp(self):
+        self._saved = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._saved)
+
+    def test_keeps_git_config_and_drops_api_keys(self):
+        os.environ["GIT_CONFIG_COUNT"] = "1"
+        os.environ["GIT_CONFIG_KEY_0"] = "credential.helper"
+        os.environ["GIT_TERMINAL_PROMPT"] = "0"
+        os.environ["MY_SERVICE_API_KEY"] = "secret"
+        os.environ["MONKEY_9ROUTER_KEY"] = "secret2"
+        os.environ["MONKEY_WORKER_API_KEY"] = "secret3"
+        os.environ["GITHUB_TOKEN"] = "secret4"
+
+        env = worker.build_shell_env("MONKEY_9ROUTER_KEY")
+
+        self.assertEqual(env.get("GIT_CONFIG_COUNT"), "1")
+        self.assertEqual(env.get("GIT_CONFIG_KEY_0"), "credential.helper")
+        self.assertEqual(env.get("GIT_TERMINAL_PROMPT"), "0")
+        self.assertNotIn("MY_SERVICE_API_KEY", env)
+        self.assertNotIn("MONKEY_9ROUTER_KEY", env)
+        self.assertNotIn("MONKEY_WORKER_API_KEY", env)
+        self.assertNotIn("GITHUB_TOKEN", env)
+
+
+class TestCostTracker(unittest.TestCase):
+    def _response(self, model="combo/deepseek-main", prompt=100, completion=50):
+        usage = SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion, total_tokens=prompt + completion)
+        return SimpleNamespace(model=model, usage=usage)
+
+    def test_fallback_pricing_when_litellm_has_no_price(self):
+        tracker = worker.CostTracker(price_in=1.0, price_out=2.0, max_tokens_total=None)
+        # litellm.completion_cost will raise/return None for this fake response,
+        # so the flat per-1M-token fallback should carry the cost.
+        tracker(None, self._response(prompt=100, completion=50), None, None)
+        self.assertTrue(tracker.priced)
+        self.assertAlmostEqual(tracker.cost_usd, 100 * 1.0 / 1e6 + 50 * 2.0 / 1e6)
+        self.assertEqual(tracker.prompt_tokens, 100)
+        self.assertEqual(tracker.completion_tokens, 50)
+        self.assertEqual(tracker.total_tokens, 150)
+
+    def test_unpriced_without_prices_configured(self):
+        tracker = worker.CostTracker(price_in=None, price_out=None, max_tokens_total=None)
+        tracker(None, self._response(), None, None)
+        self.assertFalse(tracker.priced)
+        self.assertIsNone(tracker.final_cost_usd())
+        self.assertEqual(tracker.total_tokens, 150)
+
+    def test_models_seen_is_ordered_and_deduped(self):
+        tracker = worker.CostTracker(price_in=None, price_out=None, max_tokens_total=None)
+        tracker(None, self._response(model="combo/a"), None, None)
+        tracker(None, self._response(model="combo/b"), None, None)
+        tracker(None, self._response(model="combo/a"), None, None)
+        self.assertEqual(tracker.models_seen, ["combo/a", "combo/b"])
+
+    def test_token_cap_is_observable_after_enough_calls(self):
+        tracker = worker.CostTracker(price_in=None, price_out=None, max_tokens_total=200)
+        tracker(None, self._response(prompt=100, completion=50), None, None)
+        self.assertFalse(tracker.total_tokens > tracker.max_tokens_total)
+        tracker(None, self._response(prompt=100, completion=50), None, None)
+        self.assertTrue(tracker.total_tokens > tracker.max_tokens_total)
 
 
 class TestSteerMessage(unittest.TestCase):
@@ -149,6 +305,19 @@ class TestSteerMessage(unittest.TestCase):
         self.assertIn("hi", result.output)
         self.assertIn("SUPERVISOR STEERING", result.output)
         self.assertIn("check the edge case for empty input", result.output)
+
+
+class TestSelftest(unittest.TestCase):
+    def test_selftest_prints_selftest_ok(self):
+        import subprocess
+
+        worker_path = Path(__file__).resolve().parent.parent / "worker.py"
+        proc = subprocess.run(
+            ["uv", "run", str(worker_path), "--selftest"],
+            capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("SELFTEST_OK", proc.stdout)
 
 
 if __name__ == "__main__":
