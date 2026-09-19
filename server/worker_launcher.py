@@ -99,7 +99,14 @@ def _git_neutralization_env(repo: str) -> dict[str, str]:
     unlike the tool-layer allowlist (§8.5), which only sees commands issued
     through the shell tool.
     """
+    # protocol.allow=never is the real stop: env-injected remote.<n>.url only
+    # ADDS a second url (fetch still uses the repo's own first one), and an
+    # explicit path/URL (`git push ../x.git`) bypasses remotes entirely.
+    # Verified: push, fetch, pull, ls-remote and clone all fail with
+    # "transport '<x>' not allowed". The url/pushurl entries stay as a
+    # readable marker in `git remote -v`.
     pairs: list[tuple[str, str]] = [
+        ("protocol.allow", "never"),
         ("credential.helper", ""),
         ("core.askPass", "false" if os.name == "nt" else "/usr/bin/false"),
     ]

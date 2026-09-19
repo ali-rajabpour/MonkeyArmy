@@ -142,8 +142,10 @@ if it might be a command, so a benign case like `grep "git push"` is blocked too
 accepted false positive: refusing a safe command is cheap, missing a dangerous one is not.
 
 Enforced by **environment** (belt and braces even if the tool-layer check were bypassed): the
-launcher injects a `GIT_CONFIG_*` block that rewrites every remote's `url` and `pushurl` to an
-unreachable `monkey-army-blocked://` scheme, sets `credential.helper` empty and `core.askPass`
+launcher injects a `GIT_CONFIG_*` block with `protocol.allow=never`, so every transport (file,
+ssh, https) is refused for push, fetch, pull, ls-remote and clone, including explicit URLs and
+paths. It also points every remote's `url`/`pushurl` at a `monkey-army-blocked://` marker
+(an env-injected `url` only adds a second value, so this alone would not stop fetch), sets `credential.helper` empty and `core.askPass`
 to `false`, and sets `GIT_TERMINAL_PROMPT=0`. `SSH_AUTH_SOCK` is dropped and
 `GIT_SSH_COMMAND=false` is set, so a push to an explicit SSH URL (which bypasses the remote
 overrides) has no agent and no ssh to use either. Inherited `GIT_CONFIG_*` variables are

@@ -88,16 +88,17 @@ class TestGitNeutralizationEnv(unittest.TestCase):
     def test_no_remotes(self):
         env = _git_neutralization_env(self.repo)
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
-        self.assertEqual(env["GIT_CONFIG_COUNT"], "2")
-        pairs = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(2)}
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
+        pairs = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(3)}
         self.assertEqual(pairs["credential.helper"], "")
+        self.assertEqual(pairs["protocol.allow"], "never")
         self.assertTrue(pairs["core.askPass"] in ("/usr/bin/false", "false"))
 
     def test_one_pushurl_and_url_per_remote(self):
         _git(self.repo, "remote", "add", "origin", "https://example.invalid/repo.git")
         _git(self.repo, "remote", "add", "upstream", "https://example.invalid/upstream.git")
         env = _git_neutralization_env(self.repo)
-        self.assertEqual(env["GIT_CONFIG_COUNT"], "6")  # 2 base + 2 remotes * 2 keys
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "7")  # 3 base + 2 remotes * 2 keys
         pairs = {
             env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
             for i in range(int(env["GIT_CONFIG_COUNT"]))
