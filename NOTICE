@@ -1,0 +1,8 @@
+Monkey Army is derived from cc-delegate by Etienne Lescot, MIT licensed.
+
+Third-party components: this project's worker depends on deepagents (MIT
+licensed, https://github.com/langchain-ai/deepagents) and litellm's provider
+routing to reach third-party model endpoints. As a Claude Code plugin, it also
+runs inside Anthropic's Claude Code engine on the supervisor side, governed by
+Anthropic's Commercial Terms of Service. Review 9Router's and your chosen
+worker provider's terms before production use.

@@ -1,0 +1,13 @@
+.env
+.monkey-army/
+*.log
+__pycache__/
+.DS_Store
+.claude/handoffs/
+
+# Screenshots and recordings — never commit these (see repo rules).
+Screenshot*
+*.png
+*.gif
+*.mov
+*.mp4

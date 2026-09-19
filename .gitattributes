@@ -1,0 +1,6 @@
+# Shell scripts MUST stay LF: CRLF breaks the shebang (`bash\r: bad interpreter`)
+# and the status-line reader runs under Git Bash on Windows.
+*.sh text eol=lf
+
+# Binary assets — never apply text/EOL normalization.
+*.gif binary
