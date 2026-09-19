@@ -91,6 +91,27 @@ class TestChangedFiles(JobsTestCase):
     def test_missing_worktree_returns_empty(self):
         self.assertEqual(changed_files(str(Path(self.tmp.name) / "nope")), [])
 
+    def test_gitignored_build_artifacts_never_appear(self):
+        """A worker's own acceptance-command run (e.g. `pytest`) leaves
+        __pycache__/ behind as an incidental side effect, not an intentional
+        change. changed_files() feeds scope_check() directly, so if the repo
+        has no .gitignore for it, an in-scope task fails as failed_scope over
+        a directory the worker never meant to write to. `git status
+        --porcelain` (which changed_files uses) already excludes ignored
+        paths for free -- this only needs a .gitignore to exist, which is why
+        examples/toy-repo now ships one."""
+        (Path(self.repo) / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+        _git(self.repo, "add", ".gitignore")
+        _git(self.repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "gitignore")
+        wt = create_worktree(self.repo, "main")
+        worktree = Path(wt["worktree"])
+        (worktree / "__pycache__").mkdir()
+        (worktree / "__pycache__" / "mod.cpython-312.pyc").write_bytes(b"\x00")
+        (worktree / "real_change.py").write_text("x = 1\n", encoding="utf-8")
+        files = changed_files(wt["worktree"])
+        self.assertIn("real_change.py", files)
+        self.assertFalse(any("__pycache__" in f for f in files))
+
 
 class TestStageFiles(JobsTestCase):
     def test_stages_exactly_the_given_paths(self):

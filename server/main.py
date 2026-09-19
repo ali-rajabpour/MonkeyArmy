@@ -566,8 +566,11 @@ async def integrate_task(
     )
 )
 async def batch(
+    # *_json params are plain `str`, not `str | None`: mcp<2 only skips its
+    # JSON pre-parse for fields annotated exactly `str`, so an Optional
+    # turned the caller's JSON string into a list and failed validation.
     action: str, repo_path: str | None = None, batch_id: str | None = None,
-    goal: str | None = None, tasks_json: str | None = None,
+    goal: str | None = None, tasks_json: str = "",
     verify_command: str | None = None, mode: str | None = None,
 ) -> str:
     if action == "create":
@@ -692,14 +695,14 @@ async def configure(
     fallback_models: list[str] | None = None,
     price_input_per_mtok: float | None = None,
     price_output_per_mtok: float | None = None,
-    model_kwargs_json: str | None = None,
-    limits_json: str | None = None,
+    model_kwargs_json: str = "",
+    limits_json: str = "",
     profile: str | None = None,
     key: str | None = None,
     repo_path: str | None = None,
     text: str | None = None,
     older_than_days: int | None = None,
-    defaults_json: str | None = None,
+    defaults_json: str = "",
 ) -> str:
     if action == "status":
         cfg_store = store.load_store()
