@@ -88,9 +88,12 @@ class _MockSubprocessCase(unittest.IsolatedAsyncioTestCase):
         return patch("worker_launcher.asyncio.create_subprocess_exec", side_effect=fake)
 
     def _run_args(self) -> dict:
-        return {"spec": "x", "worktree": "", "test_command": None, "definition_of_done": None,
-                "recursion_limit": 10, "rubric_max_iterations": 1,
-                "model": "m", "api_key_env_var": "X", "api_key": None}
+        return {"title": "test task", "spec": "x", "worktree": "", "test_command": None,
+                "definition_of_done": None, "recursion_limit": 10, "rubric_max_iterations": 1,
+                "model": "m", "api_key_env_var": "X", "api_key": None,
+                "mode": "micro", "allowed_files": [], "context_files": [],
+                "fallback_models": [], "model_kwargs": {}, "price_in": None, "price_out": None,
+                "max_budget_usd": None, "max_tokens_total": None, "command_timeout": 30}
 
 
 class TestStallWatchdog(_MockSubprocessCase):

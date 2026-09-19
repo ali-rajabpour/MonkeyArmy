@@ -2,18 +2,20 @@
 # requires-python = ">=3.11"
 # dependencies = ["mcp<2"]
 # ///
-"""monkey-army MCP server, Python edition (parallel implementation of
-src/mcp-server.ts — same four tools, same response shapes, same persisted-job
-format). Runs over stdio via `uv run server/main.py`.
+"""monkey-army MCP server (§6): thin registration of the 12 tools, delegating
+everything to the stdlib-only modules beside it. Runs over stdio via
+`uv run server/main.py`.
 
-Only this module imports `mcp`; config/jobs/persistence/worker_launcher are
-stdlib-only so unit tests run without any dependency install.
+Only this module imports `mcp`; config/store/jobs/persistence/verify/
+backend/worker_launcher are stdlib-only so unit tests run without any
+dependency install.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -23,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mcp.server.fastmcp import FastMCP
 
+import backend
 import events
 import store
 import statusline_render
@@ -48,26 +51,30 @@ mcp = FastMCP("monkey-army")
 @mcp.tool(
     description=(
         "Starts an autonomous coding worker on an isolated git worktree and returns a task_id "
-        "IMMEDIATELY — the worker runs in the background and you stay free. MCP cannot push into "
-        "your context, so supervise by polling: end your turn and re-check on a cadence you "
-        "schedule (or when the user asks). Use the cheap get_task_status for liveness "
-        "(running / needs_input / done), get_task_progress for an occasional deeper audit "
-        "(files written, recent activity), answer_worker to unblock a question, and "
-        "fetch_task_result when done. max_budget_usd caps accumulated spend (default $5) — the "
-        "worker stops itself and reports what it had once the cap is crossed, rather than "
-        "running unbounded."
+        "IMMEDIATELY — the worker runs in the background and you stay free. Probes the profile "
+        "first and refuses before creating anything if it fails. allowed_files unrestricted is "
+        "allowed but returned as a warning. Supervise with wait_for_tasks, not polling; review "
+        "with task_result then review_task/integrate_task when done."
     )
 )
-async def run_dev_task(
+async def dispatch_task(
+    title: str,
     spec: str,
     repo_path: str,
     test_command: str | None = None,
     definition_of_done: str | None = None,
-    base_branch: str | None = None,
-    recursion_limit: int | None = None,
-    timeout_ms: int | None = None,
+    allowed_files: list[str] | None = None,
+    context_files: list[str] | None = None,
+    mode: str = "micro",
     profile: str | None = None,
+    batch_id: str | None = None,
+    batch_key: str | None = None,
+    base_branch: str | None = None,
+    verify_command: str | None = None,
+    lint_command: str | None = None,
     max_budget_usd: float | None = None,
+    max_tokens_total: int | None = None,
+    timeout_s: int | None = None,
 ) -> str:
     # Resolve model/key per task from the config store (facade profiles).
     # Read fresh each call so facade changes apply without a server restart.
@@ -76,15 +83,37 @@ async def run_dev_task(
     except KeyError as e:
         return json.dumps({"error": str(e)})
 
+    # Probe BEFORE creating anything (§6.1 step 2): a dead endpoint or wrong
+    # model name must never leave a worktree/branch behind for the supervisor
+    # to clean up.
+    probe_result = backend.probe(resolved, ttl_s=cfg.probe_ttl_s)
+    if not probe_result.get("ok"):
+        return json.dumps({
+            "error": f"profile {resolved['name']!r} failed its health probe: "
+                     f"{probe_result.get('error', 'no choices in response')}",
+            "probe": probe_result,
+        })
+
+    warnings: list[str] = []
+    if not allowed_files:
+        warnings.append("allowed_files is empty/unrestricted — scope enforcement will not apply to this task")
+
     wt = create_worktree(repo_path, base_branch)
     job: dict[str, Any] = {
         **wt,
-        "status": "running",
-        "turns": 0,
-        "costUsd": None,
-        "totalTokens": None,
+        "title": title, "spec": spec,
+        "testCommand": test_command, "definitionOfDone": definition_of_done,
+        "verifyCommand": verify_command, "lintCommand": lint_command,
+        "allowedFiles": allowed_files or [], "contextFiles": context_files or [],
+        "mode": mode, "profile": resolved["name"],
+        "status": "running", "attempt": 1, "turns": 0,
+        "costUsd": None, "totalTokens": None, "priced": False, "modelsSeen": [],
         "model": resolved["model"],  # for the status line / watch stream
     }
+    if batch_id:
+        job["batchId"] = batch_id
+    if batch_key:
+        job["batchKey"] = batch_key
     put_job(job)
     persist_job(job)
     statusline_render.write_statusline(job)
@@ -94,11 +123,10 @@ async def run_dev_task(
     # and sends the worker chasing phantom failures.
     preflight_report: dict[str, Any] | None = None
     if test_command:
-        # 60s cap: run_dev_task must return well within the MCP client's own
-        # tool timeout; a slow-but-legit test command shows up as advisory
-        # timed_out, never as a failed delegation start.
+        # Capped well below the MCP client's own tool timeout: a slow-but-legit
+        # test command shows up as advisory timed_out, never a failed dispatch.
         preflight_report = await asyncio.get_event_loop().run_in_executor(
-            None, verify_mod.run_test_command, test_command, wt["worktree"], 60
+            None, verify_mod.run_test_command, test_command, wt["worktree"], cfg.preflight_timeout_s
         )
         events.publish(
             wt["repo"], wt["taskId"],
@@ -106,22 +134,27 @@ async def run_dev_task(
         )
 
     limits = resolved["limits"]
+    recursion_default = limits["recursion_limit_micro"] if mode == "micro" else limits["recursion_limit_task"]
+    prices = resolved.get("price_per_mtok") or {}
     args = {
-        "spec": spec,
-        "worktree": wt["worktree"],
-        "test_command": test_command,
-        "definition_of_done": definition_of_done,
-        "recursion_limit": recursion_limit or limits["recursion_limit_task"],
-        "rubric_max_iterations": limits["rubric_max_iterations_task"],
-        "model": resolved["model"],
-        "api_key_env_var": resolved["api_key_env_var"],
-        "api_key": resolved["api_key"],
-        "fallback_models": resolved["fallback_models"],
+        "title": title, "spec": spec, "worktree": wt["worktree"],
+        "test_command": test_command, "definition_of_done": definition_of_done,
+        "allowed_files": allowed_files or [], "context_files": context_files or [],
+        "mode": mode, "model": resolved["model"], "api_base": resolved.get("api_base"),
+        "api_key_env_var": resolved.get("api_key_env_var"), "api_key": resolved.get("api_key"),
+        "fallback_models": resolved.get("fallback_models") or [],
+        "model_kwargs": resolved.get("model_kwargs") or {},
+        "price_in": prices.get("input"), "price_out": prices.get("output"),
         "max_budget_usd": max_budget_usd or limits["max_budget_usd"],
+        "max_tokens_total": max_tokens_total or limits["max_tokens_total"],
+        "recursion_limit": recursion_default,
+        "rubric_max_iterations": limits["rubric_max_iterations_task"],
+        "command_timeout": limits["command_timeout_s"],
+        "ask_timeout_s": limits["ask_timeout_s"],
     }
     # The worker runs as a background asyncio task; job state is mutated live
     # by worker_launcher (same event loop) and mirrored to disk on every change.
-    run_timeout_ms = timeout_ms or int(limits["timeout_s"] * 1000)
+    run_timeout_ms = int((timeout_s or limits["timeout_s"]) * 1000)
     task = asyncio.create_task(run_worker(cfg, job, args, run_timeout_ms))
     runtime.setdefault(job["taskId"], {})["task"] = task
 
@@ -138,11 +171,8 @@ async def run_dev_task(
         {
             "task_id": wt["taskId"], "status": "running",
             "branch": wt["branch"], "worktree": wt["worktree"],
-            "model": resolved["model"], "model_source": resolved["source"],
-            "note": "worker running in the background — you are free to continue. Don't block: end "
-                    "your turn and re-check on a cadence you schedule (or when the user asks). "
-                    "get_task_status is cheap for liveness; get_task_progress audits deeper; "
-                    "answer_worker unblocks a 'needs_input' question; fetch_task_result when done.",
+            "model": resolved["model"], "profile": resolved["name"], "mode": mode,
+            "warnings": warnings,
             **preflight_extra,
         }
     )
@@ -150,11 +180,10 @@ async def run_dev_task(
 
 @mcp.tool(
     description=(
-        "CHEAP liveness check — call this often while supervising. Returns a tiny payload: the "
-        "status (running / needs_input / succeeded / failed / timeout / cancelled), a `done` flag, "
-        "and, if the worker is blocked, the pending question. Keep polling on your own cadence; on "
-        "'needs_input' answer with answer_worker; on `done` call fetch_task_result. For a deeper "
-        "look (files written so far, recent activity) call get_task_progress instead."
+        "CHEAP liveness check — call often while supervising. Tiny payload: status (running / "
+        "needs_input / succeeded / failed / timeout / cancelled), a `done` flag, and the pending "
+        "question if blocked. On 'needs_input' use answer_worker; on `done` call fetch_task_result. "
+        "For files written so far and recent activity, call get_task_progress instead."
     )
 )
 async def get_task_status(task_id: str) -> str:
@@ -316,12 +345,10 @@ async def cancel_task(task_id: str) -> str:
 
 @mcp.tool(
     description=(
-        "Proactively redirects a RUNNING worker at any moment — not just in reply to a question "
-        "it asked. Use to course-correct: 'stop implementing X, do Y instead', 'skip the tests for "
-        "now', 'the file should be named differently'. Delivered opportunistically at the worker's "
-        "next tool call (typically within seconds, not instantaneous) — it keeps working in the "
-        "meantime. Overwrites any not-yet-delivered steer message for this task; only the latest "
-        "guidance is kept, so batch related redirections into one call."
+        "Redirects a RUNNING worker at any moment, not just in reply to a question. Use to "
+        "course-correct: 'do Y instead', 'skip the tests for now'. Delivered at the worker's next "
+        "tool call (seconds, not instant) — it keeps working meanwhile. Overwrites any "
+        "not-yet-delivered steer message; only the latest guidance is kept, so batch redirections."
     )
 )
 async def steer_task(task_id: str, message: str) -> str:
@@ -410,9 +437,11 @@ async def cleanup_task(task_id: str, delete_branch: bool | None = None) -> str:
     return json.dumps({"task_id": task_id, "cleaned": True, **result})
 
 
-# ── Configuration facade ─────────────────────────────────────────────────
-# Sovereignty rule: the supervisor must only call these tools when the user
-# explicitly asked for a configuration change (enforced by the packaged skill).
+# ── Configuration facade (§6.13) ─────────────────────────────────────────
+# Sovereignty rule (I9): the supervisor must only call configure's mutating
+# actions when the user explicitly asked for a configuration change —
+# enforced by the packaged skill and restated in the tool description below,
+# since a skill rule alone is easy for a model to drift past under pressure.
 
 from pydantic import BaseModel  # noqa: E402 - transitive dependency of mcp
 
@@ -421,78 +450,19 @@ class _ApiKeyInput(BaseModel):
     api_key: str
 
 
-@mcp.tool(
-    description=(
-        "Shows the worker configuration state: model profiles, the default profile, "
-        "per-profile auth availability (API key reachable), and the config file location. "
-        "Read-only."
-    )
-)
-async def provider_status() -> str:
-    cfg_store = store.load_store()
-    profiles = {
-        name: {**prof, "auth": store.auth_state(prof)}
-        for name, prof in cfg_store["profiles"].items()
-    }
-    return json.dumps(
-        {
-            "config_path": str(store.config_path()),
-            "default_profile": cfg_store["default_profile"],
-            "profiles": profiles,
-            "defaults": store.get_defaults(),
-        }
-    )
-
-
-@mcp.tool(
-    description=(
-        "Creates or updates a named model profile in the persistent config store. Applies "
-        "immediately (no Claude Code restart). Only call when the user explicitly asked to "
-        "add or change a profile. Optional fallback_models (same 'provider:model' convention "
-        "as model, e.g. ['litellm:openai/combo-fallback']) are tried in order via litellm's "
-        "own fallback mechanism if the primary model's call fails — only set this when the "
-        "user explicitly asked for fallback/backup models."
-    )
-)
-async def set_model_profile(
-    name: str,
-    model: str,
-    api_key_env_var: str | None = None,
-    api_base: str | None = None,
-    fallback_models: list[str] | None = None,
-) -> str:
+def _parse_json_arg(raw: str | None, label: str) -> tuple[dict[str, Any] | None, str | None]:
+    if not raw:
+        return {}, None
     try:
-        prof = store.set_profile(name, model, api_key_env_var, api_base, fallback_models)
-    except ValueError as e:
-        return json.dumps({"error": str(e)})
-    return json.dumps({"profile": name, "saved": True, **prof})
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return None, f"invalid {label}: {e}"
+    if not isinstance(parsed, dict):
+        return None, f"{label} must be a JSON object"
+    return parsed, None
 
 
-@mcp.tool(description="Removes a named model profile. Only on explicit user request.")
-async def remove_model_profile(name: str) -> str:
-    if not store.remove_profile(name):
-        return json.dumps({"error": f"unknown profile {name!r}"})
-    return json.dumps({"profile": name, "removed": True})
-
-
-@mcp.tool(description="Sets the default model profile. Only on explicit user request.")
-async def set_default_profile(name: str) -> str:
-    try:
-        store.set_default_profile(name)
-    except KeyError:
-        return json.dumps({"error": f"unknown profile {name!r}"})
-    return json.dumps({"default_profile": name})
-
-
-@mcp.tool(
-    description=(
-        "Stores an API key for a profile's api_key_env_var. Preferred path: call WITHOUT the "
-        "'key' argument — the server then asks the user directly through an MCP elicitation "
-        "dialog, so the secret never enters the model's conversation context. Passing 'key' "
-        "as an argument works but the value transits the conversation; warn the user."
-    )
-)
-async def store_api_key(profile: str, key: str | None = None) -> str:
+async def _configure_store_key(profile: str, key: str | None) -> str:
     cfg_store = store.load_store()
     prof = cfg_store["profiles"].get(profile)
     if not prof:
@@ -539,15 +509,161 @@ async def store_api_key(profile: str, key: str | None = None) -> str:
     return json.dumps({"profile": profile, "stored_as": env_var, "via": via, "note": note})
 
 
+def _configure_prune_repo(repo: str, older_than_days: int) -> dict[str, Any]:
+    cutoff = time.time() - older_than_days * 86400
+    jobs_dir = store.repo_state_dir(repo) / "jobs"
+    removed_jobs = removed_patches = removed_logs = 0
+    for job_file in (jobs_dir.glob("*.json") if jobs_dir.is_dir() else []):
+        try:
+            job = json.loads(job_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if job.get("status") not in TERMINAL_STATES:
+            continue
+        ts = job.get("finishedAt") or job.get("startedAt") or 0
+        if ts and ts > cutoff:
+            continue
+        task_id = job.get("taskId") or job_file.stem
+        job_file.unlink(missing_ok=True)
+        removed_jobs += 1
+        patch = store.repo_state_dir(repo) / "patches" / f"{task_id}.diff"
+        if patch.exists():
+            patch.unlink()
+            removed_patches += 1
+        log = store.repo_state_dir(repo) / "logs" / f"{task_id}.jsonl"
+        if log.exists():
+            log.unlink()
+            removed_logs += 1
+    try:
+        subprocess.run(["git", "worktree", "prune"], cwd=repo, capture_output=True, text=True,
+                        stdin=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return {"repo": repo, "jobs_removed": removed_jobs, "patches_removed": removed_patches, "logs_removed": removed_logs}
+
+
 @mcp.tool(
-    description="Reports whether an API key is reachable on disk/env for a profile. Read-only."
+    description=(
+        "Only call mutating actions when the user explicitly asked for a configuration change. "
+        "Manages worker profiles, defaults, API keys, and diagnostics: status, set_profile, "
+        "remove_profile, set_default, set_defaults, store_key, discover_models, probe, doctor, "
+        "add_note, prune. action selects the operation; other args vary per action."
+    )
 )
-async def auth_status(profile: str) -> str:
-    cfg_store = store.load_store()
-    prof = cfg_store["profiles"].get(profile)
-    if not prof:
-        return json.dumps({"error": f"unknown profile {profile!r}"})
-    return json.dumps({"profile": profile, **store.auth_state(prof)})
+async def configure(
+    action: str,
+    name: str | None = None,
+    model: str | None = None,
+    api_base: str | None = None,
+    api_key_env_var: str | None = None,
+    fallback_models: list[str] | None = None,
+    price_input_per_mtok: float | None = None,
+    price_output_per_mtok: float | None = None,
+    model_kwargs_json: str | None = None,
+    limits_json: str | None = None,
+    profile: str | None = None,
+    key: str | None = None,
+    repo_path: str | None = None,
+    text: str | None = None,
+    older_than_days: int | None = None,
+    defaults_json: str | None = None,
+) -> str:
+    if action == "status":
+        cfg_store = store.load_store()
+        profiles = {
+            n: {**prof, "auth": store.auth_state(prof)}
+            for n, prof in cfg_store["profiles"].items()
+        }
+        return json.dumps({
+            "config_path": str(store.config_path()),
+            "default_profile": cfg_store["default_profile"],
+            "profiles": profiles,
+            "defaults": store.get_defaults(),
+            "last_probes": backend.all_last_probes(),
+        })
+
+    if action == "set_profile":
+        if not name or not model:
+            return json.dumps({"error": "set_profile requires name and model"})
+        model_kwargs, err = _parse_json_arg(model_kwargs_json, "model_kwargs_json")
+        if err:
+            return json.dumps({"error": err})
+        limits, err = _parse_json_arg(limits_json, "limits_json")
+        if err:
+            return json.dumps({"error": err})
+        prices = {}
+        if price_input_per_mtok is not None:
+            prices["input"] = price_input_per_mtok
+        if price_output_per_mtok is not None:
+            prices["output"] = price_output_per_mtok
+        try:
+            prof = store.set_profile(
+                name, model, api_key_env_var, api_base, fallback_models,
+                prices or None, model_kwargs or None, limits or None,
+            )
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+        return json.dumps({"profile": name, "saved": True, **prof})
+
+    if action == "remove_profile":
+        if not name:
+            return json.dumps({"error": "remove_profile requires name"})
+        if not store.remove_profile(name):
+            return json.dumps({"error": f"unknown profile {name!r}"})
+        return json.dumps({"profile": name, "removed": True})
+
+    if action == "set_default":
+        if not name:
+            return json.dumps({"error": "set_default requires name"})
+        try:
+            store.set_default_profile(name)
+        except KeyError:
+            return json.dumps({"error": f"unknown profile {name!r}"})
+        return json.dumps({"default_profile": name})
+
+    if action == "set_defaults":
+        patch, err = _parse_json_arg(defaults_json, "defaults_json")
+        if err:
+            return json.dumps({"error": err})
+        return json.dumps({"defaults": store.set_defaults(patch or {})})
+
+    if action == "store_key":
+        if not profile:
+            return json.dumps({"error": "store_key requires profile"})
+        return await _configure_store_key(profile, key)
+
+    if action == "discover_models":
+        try:
+            resolved = store.resolve_profile(profile)
+        except KeyError as e:
+            return json.dumps({"error": str(e)})
+        return json.dumps(backend.discover_models(resolved))
+
+    if action == "probe":
+        try:
+            resolved = store.resolve_profile(profile)
+        except KeyError as e:
+            return json.dumps({"error": str(e)})
+        return json.dumps(backend.probe(resolved, ttl_s=cfg.probe_ttl_s))
+
+    if action == "doctor":
+        return json.dumps({"checks": backend.doctor(repo_path)})
+
+    if action == "add_note":
+        if not repo_path or not text:
+            return json.dumps({"error": "add_note requires repo_path and text"})
+        try:
+            store.append_note(repo_path, text)
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+        return json.dumps({"repo_path": repo_path, "added": True})
+
+    if action == "prune":
+        repos = [str(Path(repo_path).resolve())] if repo_path else store.all_repos()
+        results = [_configure_prune_repo(r, older_than_days or 14) for r in repos]
+        return json.dumps({"pruned": results})
+
+    return json.dumps({"error": f"unknown action {action!r}"})
 
 
 if __name__ == "__main__":

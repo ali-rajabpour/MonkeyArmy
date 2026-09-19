@@ -20,6 +20,12 @@ as it arrives:
   intentional bounded wait for a supervisor answer;
 - any non-succeeded ending triggers a salvage pass so completed-but-
   uncommitted work still reaches fetch_task_result.
+
+Before spawning, this module also assembles the worker's brief file (§8.2)
+and the spawn environment: the env is filtered of anything that looks like a
+secret (§7.5), then a git-remote neutralisation block is added so nothing the
+worker runs can push, fetch, or prompt for credentials (I3), belt-and-braces
+alongside the worker's own git command allowlist.
 """
 
 from __future__ import annotations
@@ -27,10 +33,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
+import store
 from config import Defaults
 from events import publish
 from jobs import changed_files, diff_and_stat, persist_job, runtime, salvage_worktree, stage_files, write_patch
@@ -47,53 +55,186 @@ from proc_utils import kill_tree
 
 WORKER_SCRIPT = str(Path(__file__).resolve().parent.parent / "worker" / "worker.py")
 
+# Kept as an intentional duplicate of worker/worker.py's copy (§7.5): the
+# launcher filters the *process spawn* env, the worker filters the *shell
+# tool* env — two different trust boundaries, so one shared import would
+# blur which side actually enforces what. test_launcher_env.py asserts the
+# two copies agree by parsing worker.py's source (it can't be imported here
+# without its third-party deps).
+_SENSITIVE_ENV_SUBSTRINGS: tuple[str, ...] = (
+    "API_KEY",
+    "APIKEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "CREDENTIAL",
+)
+
+
+def is_sensitive_env_name(name: str) -> bool:
+    upper = name.upper()
+    return any(token in upper for token in _SENSITIVE_ENV_SUBSTRINGS)
+
 
 def comm_dir_for(job: dict[str, Any]) -> Path:
     return repo_state_dir(job["repo"]) / "comm" / job["taskId"]
 
 
-def _build_args(cfg: Defaults, args: dict[str, Any]) -> list[str]:
-    # Model, key env var and per-profile limits are resolved per task
-    # (store.resolve_profile) and passed in via `args` by main.py; only the
-    # process-wide command timeout comes from cfg here.
-    cli = [
-        "run", WORKER_SCRIPT,
-        "--worktree", args["worktree"],
-        "--spec", args["spec"],
-        "--model", args["model"],
-        "--api-key-env-var", args.get("api_key_env_var") or "",
-        "--recursion-limit", str(args["recursion_limit"]),
-        "--rubric-max-iterations", str(args["rubric_max_iterations"]),
-        "--command-timeout", str(cfg.command_timeout_s),
+def _git_remotes(repo: str) -> list[str]:
+    try:
+        out = subprocess.run(
+            ["git", "remote"], cwd=repo, capture_output=True, text=True,
+            check=True, stdin=subprocess.DEVNULL, timeout=10,
+        ).stdout
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _git_neutralization_env(repo: str) -> dict[str, str]:
+    """§7.5 GIT_CONFIG_* block. Because the worker passes its (filtered)
+    process env straight through to the shell backend, this reaches every
+    `git` invocation the worker makes, whatever command form it uses —
+    unlike the tool-layer allowlist (§8.5), which only sees commands issued
+    through the shell tool.
+    """
+    pairs: list[tuple[str, str]] = [
+        ("credential.helper", ""),
+        ("core.askPass", "false" if os.name == "nt" else "/usr/bin/false"),
     ]
-    if args.get("definition_of_done"):
-        cli += ["--definition-of-done", args["definition_of_done"]]
-    if args.get("test_command"):
-        cli += ["--test-command", args["test_command"]]
-    if args.get("fallback_models"):
-        cli += ["--fallback-models", ",".join(args["fallback_models"])]
-    if args.get("max_budget_usd") is not None:
-        cli += ["--max-budget-usd", str(args["max_budget_usd"])]
-    return cli
+    for remote in _git_remotes(repo):
+        pairs.append((f"remote.{remote}.pushurl", "monkey-army-blocked://push-disabled"))
+        pairs.append((f"remote.{remote}.url", "monkey-army-blocked://fetch-disabled"))
+    env = {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": str(len(pairs))}
+    for i, (key, value) in enumerate(pairs):
+        env[f"GIT_CONFIG_KEY_{i}"] = key
+        env[f"GIT_CONFIG_VALUE_{i}"] = value
+    return env
 
 
-async def run_worker(cfg: Defaults, job: dict[str, Any], args: dict[str, Any], timeout_ms: int) -> None:
-    """Run one delegated task to completion, mutating + persisting `job`."""
-    # A profile without a stored key (e.g. keyless local routing) runs
-    # without MONKEY_WORKER_API_KEY set, so litellm/9Router falls back to
-    # whatever default auth the endpoint expects.
-    env = {**os.environ}
+def build_spawn_env(job: dict[str, Any], args: dict[str, Any], comm_dir: Path, ask_timeout_s: int) -> dict[str, str]:
+    # SSH_AUTH_SOCK would let `git push <explicit ssh url>` bypass the
+    # remote.<name>.url overrides below; stale GIT_CONFIG_* indices from the
+    # parent env would survive our block.
+    env = {
+        k: v for k, v in os.environ.items()
+        if not is_sensitive_env_name(k) and k != "SSH_AUTH_SOCK" and not k.startswith("GIT_CONFIG_")
+    }
+    env["GIT_SSH_COMMAND"] = "false"
     resolved_key = args.get("api_key")
     if resolved_key:
         env["MONKEY_WORKER_API_KEY"] = resolved_key
     else:
         env.pop("MONKEY_WORKER_API_KEY", None)
+    env["MONKEY_COMM_DIR"] = str(comm_dir)
+    env["MONKEY_ASK_TIMEOUT_S"] = str(ask_timeout_s)
+    env.update(_git_neutralization_env(job["repo"]))
+    return env
 
-    # Mailbox for supervisor answers to worker questions (ask_supervisor /
-    # report_blocker). The worker polls files here while blocked.
+
+def _read_conventions(repo: str, max_chars: int) -> str:
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        try:
+            return (Path(repo) / name).read_text(encoding="utf-8")[:max_chars]
+        except (FileNotFoundError, OSError):
+            continue
+    return ""
+
+
+def build_brief(job: dict[str, Any], args: dict[str, Any], defaults: Defaults, feedback: str | None = None) -> Path:
+    """Write comm/<id>/brief.md (§8.2) and return its path. Rebuilt (with a
+    feedback section appended) on every retry — the worker always reads the
+    brief file fresh, so this is the only thing that needs to change between
+    attempts in the same worktree.
+    """
+    allowed = args.get("allowed_files") or []
+    allowed_section = "\n".join(f"- {g}" for g in allowed) if allowed else "- unrestricted — but stay minimal"
+    context = args.get("context_files") or []
+    context_section = "\n".join(f"- {c}" for c in context) if context else "- (none given)"
+    test_command = args.get("test_command")
+    dod = args.get("definition_of_done") or (
+        f"Running `{test_command}` exits 0." if test_command else "Make the described change."
+    )
+    acceptance = test_command or "(no acceptance command given — use your own judgement)"
+    conventions = _read_conventions(job["repo"], defaults.conventions_max_chars)
+    notes = store.read_notes(job["repo"], defaults.notes_max_chars)
+
+    parts = [
+        f"# Task: {args['title']}",
+        args["spec"],
+        "",
+        "# Allowed files (you may create/modify ONLY these; anything else fails the task)",
+        allowed_section,
+        "",
+        "# Read first",
+        context_section,
+        "",
+        "# Definition of done",
+        dod,
+        "",
+        "# Acceptance command",
+        f"`{acceptance}`   ← run it; iterate until it exits 0; then stop.",
+    ]
+    if conventions:
+        parts += ["", "# Repository conventions (excerpt of AGENTS.md / CLAUDE.md)", conventions]
+    if notes:
+        parts += ["", "# Supervisor notes for this repository", notes]
+    if feedback:
+        attempt = job.get("attempt", 1)
+        parts += [
+            "",
+            f"# Supervisor feedback on attempt {attempt}",
+            feedback,
+            "Your previous changes are present in the working directory. Fix them; do not start over.",
+        ]
+
     comm_dir = comm_dir_for(job)
     comm_dir.mkdir(parents=True, exist_ok=True)
-    env["MONKEY_COMM_DIR"] = str(comm_dir)
+    brief_path = comm_dir / "brief.md"
+    brief_path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+    return brief_path
+
+
+def _fmt_opt(value: Any) -> str:
+    """CLI convention worker.py expects: empty string means "unset" (§8.2)."""
+    return "" if value is None else str(value)
+
+
+def _build_args(cfg: Defaults, args: dict[str, Any], brief_path: Path) -> list[str]:
+    return [
+        "run", WORKER_SCRIPT,
+        "--worktree", args["worktree"],
+        "--brief", str(brief_path),
+        "--model", args["model"],
+        "--api-base", _fmt_opt(args.get("api_base")),
+        "--api-key-env-var", args.get("api_key_env_var") or "",
+        "--fallback-models", ",".join(args.get("fallback_models") or []),
+        "--model-kwargs-json", json.dumps(args["model_kwargs"]) if args.get("model_kwargs") else "",
+        "--price-in", _fmt_opt(args.get("price_in")),
+        "--price-out", _fmt_opt(args.get("price_out")),
+        "--max-budget-usd", _fmt_opt(args.get("max_budget_usd")),
+        "--max-tokens-total", _fmt_opt(args.get("max_tokens_total")),
+        "--mode", args.get("mode") or "micro",
+        "--recursion-limit", _fmt_opt(args.get("recursion_limit")),
+        "--rubric-max-iterations", str(args.get("rubric_max_iterations", 4)),
+        "--command-timeout", str(args.get("command_timeout") or cfg.command_timeout_s),
+        "--allowed-files", ",".join(args.get("allowed_files") or []),
+        "--test-command", args.get("test_command") or "",
+        "--definition-of-done", args.get("definition_of_done") or "",
+    ]
+
+
+async def run_worker(
+    cfg: Defaults, job: dict[str, Any], args: dict[str, Any], timeout_ms: int,
+    feedback: str | None = None,
+) -> None:
+    """Run one delegated task to completion, mutating + persisting `job`."""
+    comm_dir = comm_dir_for(job)
+    comm_dir.mkdir(parents=True, exist_ok=True)
+    brief_path = build_brief(job, args, cfg, feedback=feedback)
+
+    ask_timeout_s = args.get("ask_timeout_s") or cfg.ask_timeout_s
+    env = build_spawn_env(job, args, comm_dir, ask_timeout_s)
 
     def _publish(event: dict[str, Any]) -> None:
         publish(job["repo"], job["taskId"], event)
@@ -107,7 +248,7 @@ async def run_worker(cfg: Defaults, job: dict[str, Any], args: dict[str, Any], t
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "uv", *_build_args(cfg, args),
+            "uv", *_build_args(cfg, args, brief_path),
             # stdin MUST be detached: this server's own stdin is the MCP
             # protocol channel, and an inheriting child steals protocol bytes.
             stdin=asyncio.subprocess.DEVNULL,
@@ -264,6 +405,13 @@ async def run_worker(cfg: Defaults, job: dict[str, Any], args: dict[str, Any], t
     job["summary"] = result.get("summary")
     job["costUsd"] = result.get("cost_usd")
     job["totalTokens"] = result.get("total_tokens")
+    job["priced"] = result.get("priced", False)
+    job["modelsSeen"] = result.get("models_seen", [])
+    # The worker's own verdict, kept for the record — it does NOT decide
+    # job.status on its own past this WP: §7.3's finalize_success (WP4) is
+    # what actually re-verifies and commits. Here it's still the direct
+    # decider only via the temporary pass-through below.
+    job["workerClaimedStatus"] = result.get("status")
     job.pop("question", None)
 
     if result.get("status") == "succeeded" and not rt.get("cancelled"):
@@ -287,3 +435,13 @@ async def run_worker(cfg: Defaults, job: dict[str, Any], args: dict[str, Any], t
         })
     else:
         _finalize_failure(result.get("error") or "worker reported failure")
+
+
+async def retry(cfg: Defaults, job: dict[str, Any], args: dict[str, Any], feedback: str, timeout_ms: int) -> None:
+    """Re-spawn the worker in the SAME worktree with a "Supervisor feedback"
+    section appended to the brief — used by review_task(verdict='reject')
+    (WP5). Caller is responsible for having already bumped job["attempt"]
+    and set job["status"] = "running" before awaiting this.
+    """
+    job.pop("question", None)
+    await run_worker(cfg, job, args, timeout_ms, feedback=feedback)
