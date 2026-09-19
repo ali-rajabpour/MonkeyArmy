@@ -238,6 +238,9 @@ with deepagents 0.7.0a6.
 - The probe strips the litellm provider prefix up to the first `/` (`openai/combo/x` →
   `combo/x`) for the raw HTTP call; the worker passes the full string to `ChatLiteLLM`, and
   litellm strips it itself (verified with `litellm.get_llm_provider`).
+- JSON-string tool params (`tasks_json`, `model_kwargs_json`, `limits_json`, `defaults_json`) are
+  typed plain `str = ""`: `mcp<2` pre-parses JSON strings unless the annotation is exactly `str`,
+  which broke `batch create` for real clients. Found by the offline end-to-end run.
 - `task_result` replaced the old `fetch_task_result` outright instead of coexisting with it.
 - `--worktree`/`--brief` are optional in the worker's argparse (checked manually after the
   `--selftest` branch) so `worker.py --selftest` runs without them.
