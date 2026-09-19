@@ -166,5 +166,44 @@ class TestStallWatchdog(_MockSubprocessCase):
         runtime.pop(job["taskId"], None)
 
 
+class TestFinalizePipelineWiring(_MockSubprocessCase):
+    """§7.3/WP4: after RESULT_JSON, the server's own pipeline decides the
+    verdict — a worker's claimed status only short-circuits the plain
+    'failed' path when nothing actually changed on disk."""
+
+    async def test_worker_claims_failed_but_changes_present_still_goes_through_pipeline(self):
+        script = _write_mock_script(self.mock_dir, "failed_with_changes.py", """
+            with open("done.txt", "w") as f:
+                f.write("work happened before the worker gave up")
+            print('RESULT_JSON:{"status":"failed","error":"gave up","turns":1,"summary":"partial"}')
+        """)
+        job = self._job_for()
+        cfg = _make_cfg(stall_timeout_s=300)
+
+        with self._patched_exec(script, cwd=job["worktree"]):
+            await run_worker(cfg, job, self._run_args(), timeout_ms=30_000)
+
+        # The pipeline decided the real verdict, not the worker's own claim.
+        self.assertEqual(job["status"], "succeeded")
+        self.assertEqual(job["workerClaimedStatus"], "failed")
+        self.assertIn("done.txt", job["filesChanged"])
+        self.assertIsNotNone(job["commitSha"])
+        runtime.pop(job["taskId"], None)
+
+    async def test_worker_claims_failed_with_nothing_changed_is_plain_failed(self):
+        script = _write_mock_script(self.mock_dir, "failed_no_changes.py", """
+            print('RESULT_JSON:{"status":"failed","error":"could not start","turns":0,"summary":null}')
+        """)
+        job = self._job_for()
+        cfg = _make_cfg(stall_timeout_s=300)
+
+        with self._patched_exec(script, cwd=job["worktree"]):
+            await run_worker(cfg, job, self._run_args(), timeout_ms=30_000)
+
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error"], "could not start")
+        runtime.pop(job["taskId"], None)
+
+
 if __name__ == "__main__":
     unittest.main()

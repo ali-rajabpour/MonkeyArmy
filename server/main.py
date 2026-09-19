@@ -126,7 +126,7 @@ async def dispatch_task(
         # Capped well below the MCP client's own tool timeout: a slow-but-legit
         # test command shows up as advisory timed_out, never a failed dispatch.
         preflight_report = await asyncio.get_event_loop().run_in_executor(
-            None, verify_mod.run_test_command, test_command, wt["worktree"], cfg.preflight_timeout_s
+            None, verify_mod.run_command, test_command, wt["worktree"], cfg.preflight_timeout_s
         )
         events.publish(
             wt["repo"], wt["taskId"],
@@ -182,7 +182,7 @@ async def dispatch_task(
     description=(
         "CHEAP liveness check — call often while supervising. Tiny payload: status (running / "
         "needs_input / succeeded / failed / timeout / cancelled), a `done` flag, and the pending "
-        "question if blocked. On 'needs_input' use answer_worker; on `done` call fetch_task_result. "
+        "question if blocked. On 'needs_input' use answer_worker; on `done` call task_result. "
         "For files written so far and recent activity, call get_task_progress instead."
     )
 )
@@ -204,7 +204,7 @@ async def get_task_status(task_id: str) -> str:
             "first if it's genuinely their decision"
         )
     if status in TERMINAL_STATES:
-        payload["next"] = "fetch_task_result(task_id)"
+        payload["next"] = "task_result(task_id)"
     if j.get("error"):
         payload["error"] = j["error"]
     return json.dumps(payload)
@@ -254,30 +254,48 @@ async def get_task_progress(task_id: str, activity_limit: int = 12) -> str:
 
 @mcp.tool(
     description=(
-        "Returns summary, patch, files changed, tests and cost of a finished task. Works for "
-        "non-succeeded tasks too: when 'salvaged' is true, the patch contains the worker's "
-        "uncommitted work preserved at failure/cancel time — review it before re-delegating."
+        "Returns the full result of a finished task: summary, verification, scope/diff checks, "
+        "patch (inlined when small enough), cost, and what to do next (review_task or "
+        "cleanup_task). Works for non-succeeded tasks too — 'salvaged'/patch still show whatever "
+        "work existed at failure/cancel time."
     )
 )
-async def fetch_task_result(task_id: str) -> str:
+async def task_result(task_id: str, include_patch: bool = True) -> str:
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
+    diffstat = j.get("diffstat")
+    patch = None
+    if include_patch and j.get("patchPath") and diffstat and diffstat.get("lines", 0) <= cfg.max_diff_lines:
+        try:
+            patch = Path(j["patchPath"]).read_text(encoding="utf-8")
+        except OSError:
+            patch = None
+    status = j.get("status")
     return json.dumps(
         {
             "task_id": task_id,
-            "status": j.get("status"),
-            "summary": j.get("summary"),
+            "title": j.get("title"),
+            "status": status,
+            "attempt": j.get("attempt", 1),
+            "review": j.get("review"),
+            "verification": j.get("verification"),
+            "scope": j.get("scope"),
+            "diffstat": diffstat,
+            "patch": patch,
             "patch_path": j.get("patchPath"),
             "files_changed": j.get("filesChanged", []),
-            "tests": j.get("tests", {}),
             "cost_usd": j.get("costUsd"),
             "total_tokens": j.get("totalTokens"),
-            "num_turns": j.get("turns", 0),
+            "priced": j.get("priced", False),
+            "models_seen": j.get("modelsSeen", []),
+            "summary": j.get("summary"),
+            "error": j.get("error"),
+            "salvaged": j.get("salvaged", False),
             "branch": j.get("branch"),
             "worktree": j.get("worktree"),
-            "salvaged": j.get("salvaged", False),
-            "error": j.get("error"),
+            "next": ("review_task(task_id, 'approve'|'reject', feedback)"
+                     if status == "succeeded" else "cleanup_task(task_id)"),
         }
     )
 
@@ -285,7 +303,7 @@ async def fetch_task_result(task_id: str) -> str:
 @mcp.tool(
     description=(
         "Cancels a running task: kills the worker's whole process tree, salvages any uncommitted "
-        "work onto the monkey branch (fetch_task_result then returns the patch), and marks the "
+        "work onto the monkey branch (task_result then returns the patch), and marks the "
         "task 'cancelled' so cleanup_task can proceed. Use for stalled or runaway workers."
     )
 )
@@ -338,7 +356,7 @@ async def cancel_task(task_id: str) -> str:
             "status": j.get("status"),
             "salvaged": j.get("salvaged", False),
             "patch_path": j.get("patchPath"),
-            "note": "worktree and branch still exist; fetch_task_result for salvaged work, cleanup_task to discard",
+            "note": "worktree and branch still exist; task_result for salvaged work, cleanup_task to discard",
         }
     )
 

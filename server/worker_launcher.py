@@ -39,9 +39,10 @@ from pathlib import Path
 from typing import Any
 
 import store
+import verify
 from config import Defaults
 from events import publish
-from jobs import changed_files, diff_and_stat, persist_job, runtime, salvage_worktree, stage_files, write_patch
+from jobs import changed_files, persist_job, runtime, salvage_worktree
 from statusline_render import write_statusline
 from persistence import (
     find_last_result_line,
@@ -408,33 +409,33 @@ async def run_worker(
     job["priced"] = result.get("priced", False)
     job["modelsSeen"] = result.get("models_seen", [])
     # The worker's own verdict, kept for the record — it does NOT decide
-    # job.status on its own past this WP: §7.3's finalize_success (WP4) is
-    # what actually re-verifies and commits. Here it's still the direct
-    # decider only via the temporary pass-through below.
+    # job.status on its own (I4): §7.3's finalize_success re-verifies, scope-
+    # checks, caps the diff, and commits. The one exception is a worker
+    # failure that left nothing changed — nothing for the pipeline to do.
     job["workerClaimedStatus"] = result.get("status")
     job.pop("question", None)
 
-    if result.get("status") == "succeeded" and not rt.get("cancelled"):
-        # Temporary pass-through: stage everything changed and report the
-        # diff. The full verify/scope/commit pipeline (§7.3 finalize_success)
-        # is WP4 — this WP only needs jobs.py's new primitives wired in.
-        worktree = job["worktree"]
-        files = changed_files(worktree)
-        stage_files(worktree, files)
-        d = diff_and_stat(worktree, job["baseSha"])
-        job["patchPath"] = str(write_patch(job["slug"], job["taskId"], d["patch"]))
-        job["filesChanged"] = [f["path"] for f in d["files"]]
-        job["diffstat"] = {"added": d["added"], "removed": d["removed"], "lines": d["lines"]}
-        job["status"] = "succeeded"
+    if rt.get("cancelled"):
+        # A cancel raced the worker's own RESULT_JSON — cancellation wins
+        # regardless of what the worker claims; today's salvage path applies.
+        _finalize_failure(result.get("error") or "worker reported failure")
+        return
+
+    if result.get("status") != "succeeded" and not changed_files(job["worktree"]):
+        job["status"] = "failed"
+        job["error"] = result.get("error") or "worker reported failure"
         persist_job(job)
         write_statusline(job)
-        _publish({
-            "kind": "succeeded",
-            "files_changed": len(job.get("filesChanged", [])),
-            "cost_usd": job.get("costUsd"),
-        })
-    else:
-        _finalize_failure(result.get("error") or "worker reported failure")
+        _publish({"kind": "failed", "error": job["error"]})
+        return
+
+    # Either the worker claimed success, or it claimed failure but left
+    # changes on disk (the work may be complete — a field lesson, §7.3): both
+    # go through the same server-side pipeline, which decides the real
+    # verdict. It runs real git/test subprocesses, so keep it off the event
+    # loop.
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, verify.finalize_success, job, cfg)
 
 
 async def retry(cfg: Defaults, job: dict[str, Any], args: dict[str, Any], feedback: str, timeout_ms: int) -> None:

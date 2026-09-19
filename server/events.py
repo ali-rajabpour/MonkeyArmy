@@ -83,13 +83,21 @@ def event_message(ev: dict[str, Any]) -> str:
         return "worker started" + (f" · {ev['model']}" if ev.get("model") else "")
     if kind == "preflight":
         return "preflight: " + str(ev.get("note") or "")
+    if kind == "verifying":
+        return "🔍 verifying: re-running tests, checking scope and diff size"
     if kind == "succeeded":
         n = ev.get("files_changed")
         cost = ev.get("cost_usd")
         tail = (f" · {n} file{'s' if n != 1 else ''}" if n else "") + (
             f" · ${cost:.2f}" if isinstance(cost, (int, float)) else "")
         return "✓ done" + tail
-    if kind in ("failed", "timeout"):
+    if kind == "integrated":
+        sha = ev.get("commit_sha")
+        return "✓ integrated" + (f" · {sha[:8]}" if sha else "")
+    if kind == "retry":
+        return f"↻ retry attempt {ev.get('attempt', '?')}" + (
+            f" · {ev['feedback'][:120]}" if ev.get("feedback") else "")
+    if kind in ("failed", "timeout", "failed_scope", "failed_oversized", "failed_verification"):
         return f"✗ {kind} · " + str(ev.get("error") or "")[:120]
     if kind == "cancelled":
         return "⊘ " + str(ev.get("error") or "cancelled")[:120]

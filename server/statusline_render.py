@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from config import home_dir
+from persistence import ACTIVE as _ACTIVE_STATUSES, TERMINAL as _TERMINAL_STATUSES
 
 # ANSI status colors.
 _RESET = "\033[0m"
@@ -36,11 +37,27 @@ _GREY = "\033[90m"
 # Per-status: (emoji, color, expiry-seconds-from-now).
 _STYLE: dict[str, tuple[str, str, int]] = {
     "running": ("⏳", _CYAN, 150),      # refreshed on every event while active
+    "verifying": ("🔍", _CYAN, 150),    # post-run server-side gate (§7.3) — still ACTIVE
     "needs_input": ("⚠", _YELLOW, 3600),  # a human may take a while — keep visible
     "succeeded": ("✓", _GREEN, 30),
+    "integrated": ("✓", _GREEN, 30),
     "failed": ("✗", _RED, 30),
+    "failed_scope": ("✗", _RED, 30),
+    "failed_oversized": ("✗", _RED, 30),
+    "failed_verification": ("✗", _RED, 30),
     "timeout": ("✗", _RED, 30),
     "cancelled": ("⊘", _GREY, 20),
+}
+
+_TERMINAL_LABEL: dict[str, str] = {
+    "succeeded": "done",
+    "integrated": "integrated",
+    "failed": "failed",
+    "failed_scope": "failed (out of scope)",
+    "failed_oversized": "failed (diff too large)",
+    "failed_verification": "failed (verification)",
+    "timeout": "timed out",
+    "cancelled": "cancelled",
 }
 
 
@@ -84,7 +101,7 @@ def render(job: dict[str, Any], now: float | None = None) -> tuple[int, str] | N
     if model:
         parts.append(model)
 
-    if status == "running":
+    if status in ("running", "verifying"):
         step = job.get("lastStep")
         if step:
             parts.append(f"step {step}")
@@ -95,10 +112,8 @@ def render(job: dict[str, Any], now: float | None = None) -> tuple[int, str] | N
         parts.append("asks: " + _trim(q.get("message", "input needed"), 40))
         parts.append("→ answer_worker")
     else:  # terminal
-        label = {"succeeded": "done", "failed": "failed",
-                 "timeout": "timed out", "cancelled": "cancelled"}[status]
-        parts.append(label)
-        if status == "succeeded":
+        parts.append(_TERMINAL_LABEL[status])
+        if status in ("succeeded", "integrated"):
             n = len(job.get("filesChanged", []))
             if n:
                 parts.append(f"{n} file{'s' if n != 1 else ''}")
@@ -106,16 +121,37 @@ def render(job: dict[str, Any], now: float | None = None) -> tuple[int, str] | N
             parts.append("work salvaged")
         if job.get("costUsd") is not None:
             parts.append(f"${job['costUsd']:.2f}")
-        if status != "succeeded" and job.get("error"):
+        if status not in ("succeeded", "integrated") and job.get("error"):
             parts.append(_trim(job["error"], 40))
 
     line = head + " · " + " · ".join(parts) if parts else head
     return int(now + ttl), f"{color}{line}{_RESET}"
 
 
+def _aggregate(snapshot: list[dict[str, Any]], now: float) -> tuple[int, str]:
+    running = sum(1 for j in snapshot if j.get("status") in ("running", "verifying"))
+    asks = sum(1 for j in snapshot if j.get("status") == "needs_input")
+    done = sum(1 for j in snapshot if j.get("status") in _TERMINAL_STATUSES)
+    cost = sum(j.get("costUsd") or 0 for j in snapshot)
+    line = f"⏳ {running} running · ⚠ {asks} asks · ✓ {done} done · ${cost:.2f}"
+    return int(now + 150), f"{_CYAN}{line}{_RESET}"
+
+
 def write_statusline(job: dict[str, Any]) -> None:
-    """Best-effort write of the global status-line file. Never raises."""
-    rendered = render(job)
+    """Best-effort write of the global status-line file. Never raises.
+
+    Normally renders `job`'s own line. When more than one job is ACTIVE in
+    THIS process (jobs.all_jobs() — an in-memory, per-process view; a
+    restarted server starts this count over) an aggregate line replaces it,
+    so concurrent delegations don't fight over the single status-line slot.
+    """
+    try:
+        from jobs import all_jobs
+        snapshot = all_jobs()
+    except Exception:  # noqa: BLE001 - status line must never break the caller
+        snapshot = []
+    active = sum(1 for j in snapshot if j.get("status") in _ACTIVE_STATUSES)
+    rendered = _aggregate(snapshot, time.time()) if active > 1 else render(job)
     path = global_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
