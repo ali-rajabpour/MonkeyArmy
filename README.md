@@ -58,6 +58,16 @@ If you launch Claude Code through a custom agent/persona with an explicit `tools
 `mcp__plugin_monkey-army_monkeys` to it — otherwise the server connects but its tools never
 reach the session.
 
+## Status line
+
+An orange badge shows the active profile, and live worker counts while tasks run:
+
+```
+🐒 deepseek-combo ⏳2 ⚠1 $0.12
+```
+
+Nothing is shown until a profile is configured. Setup: [`docs/SETUP.md`](docs/SETUP.md#optional-status-line).
+
 ## What a run looks like (illustrative)
 
 ```

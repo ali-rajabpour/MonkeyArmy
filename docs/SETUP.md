@@ -70,13 +70,42 @@ Then: `/monkey-army add a subtract(a, b) function to calc/__init__.py with tests
 Watch the plan, the review, and the single squash commit that lands on `main`.
 
 ## Optional: status line
+
+Two scripts ship in `statusline/`. Both are token-free: the MCP server pre-renders the text to
+`~/.monkey-army/statusline` and the scripts only print it.
+
+**Badge** (`monkey-army-badge.sh`) — one short orange segment, meant to sit next to other
+plugins' badges. Shows the default profile, plus live worker activity while tasks run:
+
+```
+🐒 deepseek-combo                     configured, nothing running
+🐒 deepseek-combo ⏳2 ⚠1 $0.12        two workers, one waiting on you, spend so far
+```
+
+It prints nothing at all when no profile is configured. If you already have a combined
+status-line script, add it as a segment:
+
+```bash
+root=$(jq -r '.plugins["monkey-army@monkey-army"][0].installPath' ~/.claude/plugins/installed_plugins.json)
+printf '%s' "$INPUT" | bash "$root/statusline/monkey-army-badge.sh"
+```
+
+Or use it on its own in `~/.claude/settings.json`:
+```json
+{ "statusLine": { "type": "command", "command": "~/.claude/monkey-army-badge.sh", "refreshInterval": 2 } }
+```
+
+**Full line** (`monkey-army-statusline.sh`) — takes the whole status line and prints the
+server's rendered line only while a task is active:
 ```bash
 cp <plugin>/statusline/monkey-army-statusline.sh ~/.claude/ && chmod +x ~/.claude/monkey-army-statusline.sh
 ```
-`~/.claude/settings.json`:
 ```json
 { "statusLine": { "type": "command", "command": "~/.claude/monkey-army-statusline.sh", "refreshInterval": 2 } }
 ```
+
+`refreshInterval` matters for both: status-line events go quiet while the session waits on a
+background worker, so the timer is what keeps the counters moving.
 
 ## Tuning (all via "configure: …", only when you ask)
 - Budget per task: `limits.max_budget_usd` (default $0.50) and `limits.max_tokens_total`.
