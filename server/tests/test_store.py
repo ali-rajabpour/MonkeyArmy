@@ -195,6 +195,19 @@ class TestDefaults(StoreTestCase):
         )
 
 
+class TestDoctorRun(StoreTestCase):
+    def test_record_sets_meta_last_doctor_at(self):
+        self.assertEqual(store.load_store()["meta"], {})
+        recorded = store.record_doctor_run()
+        self.assertEqual(store.load_store()["meta"]["last_doctor_at"], recorded)
+
+    def test_second_run_overwrites_the_timestamp(self):
+        first = store.record_doctor_run()
+        second = store.record_doctor_run()
+        self.assertGreaterEqual(second, first)
+        self.assertEqual(store.load_store()["meta"]["last_doctor_at"], second)
+
+
 class TestReposIndex(StoreTestCase):
     def test_remember_and_slug_and_state_dir(self):
         with tempfile.TemporaryDirectory() as repo:

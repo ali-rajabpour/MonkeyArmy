@@ -154,6 +154,12 @@ def validate(tasks: list[dict[str, Any]]) -> list[list[str]]:
             a_files = by_key[a_key].get("allowedFiles") or []
             b_files = by_key[b_key].get("allowedFiles") or []
             if _files_overlap(a_files, b_files):
+                if not a_files or not b_files:
+                    empty_key = a_key if not a_files else b_key
+                    raise ValueError(
+                        f"task {empty_key!r} has no allowedFiles (unrestricted) and cannot be "
+                        f"parallelized; add allowedFiles or a dependsOn edge"
+                    )
                 raise ValueError(
                     f"tasks {a_key!r} and {b_key!r} are parallelizable (no dependency relation) "
                     f"but their allowedFiles overlap — add a dependsOn edge or narrow allowedFiles"
@@ -186,6 +192,22 @@ def create(
     }
     save_manifest(manifest)
     return {"batch_id": batch_id, "order": waves}
+
+
+def find_manifest(batch_id: str) -> tuple[str, dict[str, Any]] | None:
+    """Search every repo the server has ever seen for `batch_id`'s manifest.
+    Lets `batch(action='status'|'finish', ...)` work without repo_path — the
+    skill's own §2.7 call doesn't pass one, and a batch_id is already
+    globally unique (new_batch_id), so there's nothing repo_path adds here
+    except which repo to look in first.
+    """
+    from persistence import all_repos
+
+    for repo in all_repos():
+        manifest = load_manifest(repo, batch_id)
+        if manifest is not None:
+            return repo, manifest
+    return None
 
 
 def link(repo: str, batch_id: str, key: str, task_id: str) -> None:

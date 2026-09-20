@@ -77,6 +77,7 @@ def load_store() -> dict[str, Any]:
     store.setdefault("profiles", {})
     store.setdefault("default_profile", None)
     store.setdefault("defaults", {})
+    store.setdefault("meta", {})
     return store
 
 
@@ -330,6 +331,16 @@ def append_note(repo_path: str | Path, text: str) -> None:
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(combined, encoding="utf-8")
+
+
+def record_doctor_run() -> float:
+    """Persist meta.last_doctor_at — configure(action='status') surfaces it
+    so the supervisor can see how stale the last health check is."""
+    st = load_store()
+    now = time.time()
+    st["meta"]["last_doctor_at"] = now
+    save_store(st)
+    return now
 
 
 # ── Maintenance (§6.13 `configure(action='prune')`) ─────────────────────

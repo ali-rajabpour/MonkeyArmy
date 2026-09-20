@@ -349,6 +349,7 @@ async def run_worker(
         # instead of always collapsing to "failed".
         job["status"] = "cancelled" if rt.get("cancelled") else kind
         job["error"] = "cancelled by supervisor" if rt.get("cancelled") else error
+        job["finishedAt"] = time.time()
         job.pop("question", None)
         if salvage_worktree(job):
             job["salvaged"] = True
@@ -463,6 +464,7 @@ async def run_worker(
     if result.get("status") != "succeeded" and not changed_files(job["worktree"]):
         job["status"] = "failed"
         job["error"] = result.get("error") or "worker reported failure"
+        job["finishedAt"] = time.time()
         persist_job(job)
         write_statusline(job)
         _publish({"kind": "failed", "error": job["error"]})

@@ -36,6 +36,7 @@ from jobs import (
     stage_files,
     write_patch,
 )
+from persistence import TERMINAL
 from proc_utils import kill_tree
 from statusline_render import write_statusline
 
@@ -260,6 +261,8 @@ def finalize_success(job: dict[str, Any], cfg: Defaults) -> None:
     """
 
     def _checkpoint(kind: str) -> None:
+        if job.get("status") in TERMINAL:
+            job["finishedAt"] = time.time()
         persist_job(job)
         write_statusline(job)
         event: dict[str, Any] = {"kind": kind}
@@ -301,6 +304,12 @@ def finalize_success(job: dict[str, Any], cfg: Defaults) -> None:
         job["status"] = "failed_scope"
         job["error"] = "out-of-scope files changed: " + ", ".join(scope["violations"])
         _checkpoint("failed_scope")
+        return
+
+    if job["diffstat"]["lines"] == 0 and not d["files"]:
+        job["status"] = "failed"
+        job["error"] = "worker made no changes"
+        _checkpoint("failed")
         return
 
     if oversize_check(job["diffstat"], cfg.max_diff_lines):

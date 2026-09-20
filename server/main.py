@@ -2,8 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["mcp<2"]
 # ///
-"""monkey-army MCP server (§6): thin registration of the 13 tools §6 actually
-defines (its own summary line says "12"; docs record the discrepancy),
+"""monkey-army MCP server (§6): thin registration of 13 tools (§6),
 delegating everything to the stdlib-only modules beside it. Runs over stdio
 via `uv run server/main.py`.
 
@@ -42,6 +41,8 @@ from jobs import (
     get_job_with_fallback,
     persist_job,
     put_job,
+    read_patch,
+    repo_worktree_error,
     runtime,
     wait_for_tasks as jobs_wait_for_tasks,
 )
@@ -101,6 +102,13 @@ async def dispatch_task(
     timeout_s: int | None = None,
 ) -> str:
     cfg = _cfg()
+    if mode not in ("micro", "task"):
+        return json.dumps({"error": f"mode must be 'micro' or 'task', got {mode!r}"})
+
+    repo_err = await _offload(repo_worktree_error, repo_path)
+    if repo_err:
+        return json.dumps({"error": repo_err})
+
     # Resolve model/key per task from the config store (facade profiles).
     # Read fresh each call so facade changes apply without a server restart.
     try:
@@ -127,6 +135,11 @@ async def dispatch_task(
             "probe did not observe a tool call from this model — deepagents relies on tool "
             "calling; verify the combo before trusting results"
         )
+    if not test_command:
+        warnings.append(
+            "no test_command: server-side verification will pass trivially; your review is the "
+            "only gate"
+        )
 
     wt = await _offload(create_worktree, repo_path, base_branch)
     job: dict[str, Any] = {
@@ -148,37 +161,44 @@ async def dispatch_task(
         job["batchId"] = batch_id
     if batch_key:
         job["batchKey"] = batch_key
-    put_job(job)
-    persist_job(job)
-    statusline_render.write_statusline(job)
-    if batch_id and batch_key:
-        try:
-            batches.link(repo_path, batch_id, batch_key, wt["taskId"])
-        except KeyError as e:
-            warnings.append(f"batch link failed: {e}")
 
-    # Preflight the acceptance gate BEFORE spending worker tokens: a broken
-    # test RUNNER (vs merely failing assertions) makes the rubric unpassable
-    # and sends the worker chasing phantom failures.
-    preflight_report: dict[str, Any] | None = None
-    if test_command:
-        # Capped well below the MCP client's own tool timeout: a slow-but-legit
-        # test command shows up as advisory timed_out, never a failed dispatch.
-        preflight_report = await _offload(
-            verify_mod.run_command, test_command, wt["worktree"], cfg.preflight_timeout_s
-        )
-        events.publish(
-            wt["repo"], wt["taskId"],
-            {"kind": "preflight", "note": f"test_command exit={preflight_report.get('exit_code')}"},
-        )
+    # From here on, any failure must not leave a worktree/branch behind for
+    # the supervisor to discover and clean up by hand.
+    try:
+        put_job(job)
+        persist_job(job)
+        statusline_render.write_statusline(job)
+        if batch_id and batch_key:
+            try:
+                batches.link(repo_path, batch_id, batch_key, wt["taskId"])
+            except KeyError as e:
+                warnings.append(f"batch link failed: {e}")
 
-    limits = resolved["limits"]
-    args = worker_launcher.build_worker_args(job, resolved)
-    # The worker runs as a background asyncio task; job state is mutated live
-    # by worker_launcher (same event loop) and mirrored to disk on every change.
-    run_timeout_ms = int((timeout_s or limits["timeout_s"]) * 1000)
-    task = asyncio.create_task(run_worker(cfg, job, args, run_timeout_ms))
-    runtime.setdefault(job["taskId"], {})["task"] = task
+        # Preflight the acceptance gate BEFORE spending worker tokens: a broken
+        # test RUNNER (vs merely failing assertions) makes the rubric unpassable
+        # and sends the worker chasing phantom failures.
+        preflight_report: dict[str, Any] | None = None
+        if test_command:
+            # Capped well below the MCP client's own tool timeout: a slow-but-legit
+            # test command shows up as advisory timed_out, never a failed dispatch.
+            preflight_report = await _offload(
+                verify_mod.run_command, test_command, wt["worktree"], cfg.preflight_timeout_s
+            )
+            events.publish(
+                wt["repo"], wt["taskId"],
+                {"kind": "preflight", "note": f"test_command exit={preflight_report.get('exit_code')}"},
+            )
+
+        limits = resolved["limits"]
+        args = worker_launcher.build_worker_args(job, resolved)
+        # The worker runs as a background asyncio task; job state is mutated live
+        # by worker_launcher (same event loop) and mirrored to disk on every change.
+        run_timeout_ms = int((timeout_s or limits["timeout_s"]) * 1000)
+        task = asyncio.create_task(run_worker(cfg, job, args, run_timeout_ms))
+        runtime.setdefault(job["taskId"], {})["task"] = task
+    except Exception as e:  # noqa: BLE001 - never leave a worktree/branch orphaned
+        await _offload(cleanup_job, job)
+        return json.dumps({"error": f"dispatch failed: {type(e).__name__}: {e}"})
 
     # A broken test RUNNER makes the acceptance gate unpassable — surface it up
     # front so the supervisor can abort before the worker wastes tokens on it.
@@ -202,10 +222,11 @@ async def dispatch_task(
 
 @mcp.tool(
     description=(
-        "CHEAP liveness check — call often while supervising. Tiny payload: status (running / "
-        "needs_input / succeeded / failed / timeout / cancelled), a `done` flag, and the pending "
-        "question if blocked. On 'needs_input' use answer_worker; on `done` call task_result. "
-        "For files written so far and recent activity, call task_progress instead."
+        "CHEAP liveness check — call often while supervising. Tiny payload: status (running, "
+        "needs_input, verifying, succeeded, failed, failed_verification, failed_scope, "
+        "failed_oversized, timeout, cancelled, integrated), a `done` flag, and the pending question "
+        "if blocked. On 'needs_input' use answer_worker; on `done` call task_result. For files "
+        "written so far and recent activity, call task_progress instead."
     )
 )
 async def task_status(task_id: str) -> str:
@@ -290,12 +311,7 @@ async def task_result(task_id: str, include_patch: bool = True) -> str:
     if not j:
         return json.dumps({"error": "unknown task_id"})
     diffstat = j.get("diffstat")
-    patch = None
-    if include_patch and j.get("patchPath") and diffstat and diffstat.get("lines", 0) <= cfg.max_diff_lines:
-        try:
-            patch = Path(j["patchPath"]).read_text(encoding="utf-8")
-        except OSError:
-            patch = None
+    patch = read_patch(j["patchPath"], cfg.max_diff_lines) if include_patch and j.get("patchPath") else None
     status = j.get("status")
     return json.dumps(
         {
@@ -368,6 +384,7 @@ async def cancel_task(task_id: str) -> str:
 
         j["status"] = "cancelled"
         j["error"] = "cancelled by supervisor (stale job from a previous server session)"
+        j["finishedAt"] = time.time()
         if await _offload(salvage_worktree, j):
             j["salvaged"] = True
         persist_job(j)
@@ -600,9 +617,10 @@ async def integrate_task(
 @mcp.tool(
     description=(
         "Manages a multi-task batch. create(repo_path, goal, tasks_json) validates dependencies/"
-        "scope overlap and returns parallel waves; status(batch_id, repo_path) shows progress; "
-        "finish(batch_id, repo_path) integrates every approved task in dependency order and "
-        "reports totals. tasks_json: JSON list of {key, title, dependsOn?, allowedFiles?}."
+        "scope overlap and returns parallel waves; status(batch_id) shows progress; finish(batch_id, "
+        "verify_command?) integrates every approved task in dependency order and reports totals — "
+        "repo_path is optional for status/finish (found from batch_id). tasks_json: JSON list of "
+        "{key, title, dependsOn?, allowedFiles?}."
     )
 )
 async def batch(
@@ -629,16 +647,26 @@ async def batch(
             return json.dumps({"error": str(e)})
 
     if action == "status":
-        if not repo_path or not batch_id:
-            return json.dumps({"error": "status requires repo_path and batch_id"})
+        if not batch_id:
+            return json.dumps({"error": "status requires batch_id"})
+        if not repo_path:
+            found = await _offload(batches.find_manifest, batch_id)
+            if found is None:
+                return json.dumps({"error": f"unknown batch_id {batch_id!r}"})
+            repo_path = found[0]
         try:
             return json.dumps(batches.status(repo_path, batch_id))
         except KeyError as e:
             return json.dumps({"error": str(e)})
 
     if action == "finish":
-        if not repo_path or not batch_id:
-            return json.dumps({"error": "finish requires repo_path and batch_id"})
+        if not batch_id:
+            return json.dumps({"error": "finish requires batch_id"})
+        if not repo_path:
+            found = await _offload(batches.find_manifest, batch_id)
+            if found is None:
+                return json.dumps({"error": f"unknown batch_id {batch_id!r}"})
+            repo_path = found[0]
         try:
             return json.dumps(await _offload(batches.finish, repo_path, batch_id, verify_command, mode, cfg))
         except KeyError as e:
@@ -761,6 +789,7 @@ async def configure(
             "profiles": profiles,
             "defaults": store.get_defaults(),
             "last_probes": backend.all_last_probes(),
+            "last_doctor_at": cfg_store.get("meta", {}).get("last_doctor_at"),
         })
 
     if action == "set_profile":
@@ -831,7 +860,9 @@ async def configure(
         return json.dumps(await _offload(backend.probe, resolved, ttl_s=cfg.probe_ttl_s))
 
     if action == "doctor":
-        return json.dumps({"checks": await _offload(backend.doctor, repo_path)})
+        checks = await _offload(backend.doctor, repo_path)
+        last_doctor_at = await _offload(store.record_doctor_run)
+        return json.dumps({"checks": checks, "last_doctor_at": last_doctor_at})
 
     if action == "add_note":
         if not repo_path or not text:

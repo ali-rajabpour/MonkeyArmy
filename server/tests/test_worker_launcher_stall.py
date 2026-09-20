@@ -122,6 +122,7 @@ class TestStallWatchdog(_MockSubprocessCase):
         self.assertLess(elapsed, 15, "should be killed by the stall watchdog, not the 60s hard cap")
         self.assertTrue(job.get("salvaged"))
         self.assertIn("done_marker.txt", job.get("filesChanged", []))
+        self.assertIsNotNone(job.get("finishedAt"))
         runtime.pop(job["taskId"], None)
 
     async def test_needs_input_is_exempt_from_the_stall_watchdog(self):
@@ -152,13 +153,15 @@ class TestStallWatchdog(_MockSubprocessCase):
 
     async def test_normal_fast_completion_is_unaffected(self):
         script = _write_mock_script(self.mock_dir, "ok.py", """
+            with open("done.txt", "w") as f:
+                f.write("work happened")
             print('PROGRESS:{"step":1,"node":"agent"}', flush=True)
             print('RESULT_JSON:{"status":"succeeded","turns":1,"summary":"done","cost_usd":0.01,"total_tokens":10}')
         """)
         job = self._job_for()
         cfg = _make_cfg(stall_timeout_s=300)  # generous; must not spuriously fire
 
-        with self._patched_exec(script):
+        with self._patched_exec(script, cwd=job["worktree"]):
             await run_worker(cfg, job, self._run_args(), timeout_ms=30_000)
 
         self.assertEqual(job["status"], "succeeded")
@@ -202,6 +205,7 @@ class TestFinalizePipelineWiring(_MockSubprocessCase):
 
         self.assertEqual(job["status"], "failed")
         self.assertEqual(job["error"], "could not start")
+        self.assertIsNotNone(job.get("finishedAt"))
         runtime.pop(job["taskId"], None)
 
 
@@ -215,6 +219,8 @@ class TestRetryClearsStaleRuntime(_MockSubprocessCase):
 
     def _succeed_script(self) -> Path:
         return _write_mock_script(self.mock_dir, "retry_ok.py", """
+            with open("retry_done.txt", "w") as f:
+                f.write("retry work happened")
             print('RESULT_JSON:{"status":"succeeded","turns":1,"summary":"done","cost_usd":0.01,"total_tokens":10}')
         """)
 
@@ -229,6 +235,7 @@ class TestRetryClearsStaleRuntime(_MockSubprocessCase):
             await retry(cfg, job, self._run_args(), feedback_history=[], timeout_ms=30_000)
 
         self.assertEqual(job["status"], "cancelled")
+        self.assertIsNotNone(job.get("finishedAt"))
         runtime.pop(job["taskId"], None)
 
     async def test_reset_runtime_before_retry_lets_it_finalize_normally(self):

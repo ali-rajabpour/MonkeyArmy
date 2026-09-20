@@ -42,6 +42,13 @@ class TestValidate(unittest.TestCase):
                 {"key": "b", "allowedFiles": ["src/utils.py"]},
             ])
 
+    def test_unrestricted_task_gets_its_own_message(self):
+        with self.assertRaisesRegex(ValueError, r"task 'a' has no allowedFiles \(unrestricted\)"):
+            batches.validate([
+                {"key": "a"},
+                {"key": "b", "allowedFiles": ["src/b.py"]},
+            ])
+
     def test_disjoint_parallel_tasks_allowed(self):
         waves = batches.validate([
             {"key": "a", "allowedFiles": ["src/a/*.py"]},
@@ -128,6 +135,27 @@ class TestCreateStatusLink(_BatchCase):
     def test_link_unknown_batch_raises(self):
         with self.assertRaises(KeyError):
             batches.link(self.repo, "b_nope", "a", "mk_x")
+
+
+class TestFindManifest(_BatchCase):
+    """review-fix §D.5: batch(action='status'|'finish', batch_id) must work
+    without repo_path — the skill's own §2.7 call doesn't pass one."""
+
+    def test_finds_manifest_by_batch_id_alone(self):
+        from persistence import remember_repo
+
+        remember_repo(self.repo)  # normally done by jobs.create_worktree
+        created = batches.create(self.repo, "goal", [{"key": "a", "title": "Task A"}])
+        batch_id = created["batch_id"]
+
+        found = batches.find_manifest(batch_id)
+        self.assertIsNotNone(found)
+        repo, manifest = found
+        self.assertEqual(repo, str(Path(self.repo).resolve()))
+        self.assertEqual(manifest["batchId"], batch_id)
+
+    def test_unknown_batch_id_returns_none(self):
+        self.assertIsNone(batches.find_manifest("b_never_existed"))
 
 
 class TestFinish(_BatchCase):

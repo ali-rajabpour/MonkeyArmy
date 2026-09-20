@@ -8,6 +8,7 @@ assertion, same technique test_launcher_env.py uses for worker.py."""
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -17,8 +18,10 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import load_defaults
+from check_descriptions import find_tools
 
 MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
 
@@ -63,6 +66,45 @@ class TestMainPyHasNoFrozenModuleLevelCfg(unittest.TestCase):
         tool_count = len(re.findall(r"^@mcp\.tool\(", source, re.MULTILINE))
         cfg_reload_count = len(re.findall(r"^\s+cfg = _cfg\(\)", source, re.MULTILINE))
         self.assertEqual(cfg_reload_count, tool_count)
+
+
+class TestReviewFixDDescriptionsAndDocstring(unittest.TestCase):
+    """§D.9: task_status's description lists the real status set, and the
+    module docstring drops the "its own summary line says 12" aside for a
+    plain statement — both source-text checks since main.py needs `mcp`."""
+
+    def test_task_status_lists_every_real_status(self):
+        source = MAIN_PY.read_text(encoding="utf-8")
+        desc = find_tools(source)["task_status"]
+        for status in (
+            "running", "needs_input", "verifying", "succeeded", "failed",
+            "failed_verification", "failed_scope", "failed_oversized",
+            "timeout", "cancelled", "integrated",
+        ):
+            self.assertIn(status, desc, f"task_status description missing status {status!r}")
+
+    def test_module_docstring_states_13_tools_plainly(self):
+        source = MAIN_PY.read_text(encoding="utf-8")
+        module_docstring = ast.get_docstring(ast.parse(source))
+        self.assertIn("13 tools (§6)", module_docstring)
+        self.assertNotIn("its own summary line says", module_docstring)
+
+
+class TestReviewFixDDispatchAndBatchSourceChecks(unittest.TestCase):
+    """§D.1/§D.5: dispatch_task validates mode/repo_path and cleans up on
+    failure; batch(status|finish) resolves repo_path from batch_id when
+    omitted. Source-text checks, same reason as above."""
+
+    def test_dispatch_task_validates_mode_and_repo_path(self):
+        source = MAIN_PY.read_text(encoding="utf-8")
+        self.assertIn('mode not in ("micro", "task")', source)
+        self.assertIn("repo_worktree_error", source)
+        self.assertIn("cleanup_job, job)", source)
+        self.assertIn("no test_command", source)
+
+    def test_batch_status_and_finish_resolve_repo_from_batch_id(self):
+        source = MAIN_PY.read_text(encoding="utf-8")
+        self.assertIn("batches.find_manifest", source)
 
 
 if __name__ == "__main__":

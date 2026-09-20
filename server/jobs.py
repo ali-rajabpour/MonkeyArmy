@@ -147,6 +147,23 @@ def _git(repo: str, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def repo_worktree_error(repo_path: str) -> str | None:
+    """None if `repo_path` is inside a git work tree, else an error message.
+
+    `create_worktree`'s own git calls raise an unhandled CalledProcessError
+    on a bad path — dispatch_task checks this first so a bad repo_path comes
+    back as a normal {"error": ...} response instead of a tool crash.
+    """
+    try:
+        subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=repo_path,
+            capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, OSError) as e:
+        return f"repo_path {repo_path!r} is not a git work tree: {e}"
+    return None
+
+
 def create_worktree(repo_path: str, base_branch: str | None = None) -> dict[str, str]:
     """Create the disposable branch + worktree that isolates worker writes
     from the user's repo (I2). Lives under
@@ -279,6 +296,19 @@ def write_patch(slug: str, task_id: str, patch: str) -> Path:
     path = patch_dir / f"{task_id}.diff"
     path.write_text(patch, encoding="utf-8")
     return path
+
+
+def read_patch(patch_path: str, max_lines: int) -> str | None:
+    """Patch text if `patch_path` exists and its own line count is within
+    `max_lines`, else None. File-based rather than diffstat-based, so it
+    works for salvaged jobs too — those have patchPath but no diffstat."""
+    try:
+        text = Path(patch_path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if len(text.splitlines()) > max_lines:
+        return None
+    return text
 
 
 def commit_worktree(worktree: str, message: str) -> str | None:

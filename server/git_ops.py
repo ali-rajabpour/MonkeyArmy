@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +68,21 @@ def _parse_conflict_files(stderr: str) -> list[str]:
     return sorted(files)
 
 
+_RE_DISPATCH_SUGGESTION = "re-dispatch this task against the current branch (base moved), then integrate"
+_ALREADY_EXISTS_SUGGESTION = (
+    "an untracked file at this path exists in your tree; move it or commit it, then integrate again"
+)
+
+
+def _conflict_suggestion(stderr: str) -> str:
+    """A file that already exists in the working tree isn't a moved base —
+    re-dispatching won't fix it — so it gets its own actionable suggestion
+    instead of the generic "base moved" one."""
+    if "already exists in working directory" in stderr:
+        return _ALREADY_EXISTS_SUGGESTION
+    return _RE_DISPATCH_SUGGESTION
+
+
 def _patch_paths(repo: str, patch_path: str) -> list[str]:
     """Every path `patch_path` touches, via `git apply --numstat -z` — safe
     to call before the patch is applied (it only parses the patch text).
@@ -112,16 +128,6 @@ def integrate(
             "suggestion": "checkout the task's base branch, or pass allow_branch_mismatch=True if intentional",
         }
 
-    files_changed = job.get("filesChanged") or []
-    if files_changed:
-        dirty = _git(repo, "status", "--porcelain", "--", *files_changed).stdout
-        if dirty.strip():
-            return {
-                "task_id": task_id, "integrated": False, "reason": "dirty_overlap",
-                "details": {"files": [line[3:] for line in dirty.splitlines() if line.strip()]},
-                "suggestion": "commit or stash your own changes to these files before integrating",
-            }
-
     # Fresh from the repo (not the worktree) so it covers every attempt's
     # commits, not just the last one. --no-renames: a rename patch's
     # "rename from/to" header would make --numstat below report only the
@@ -135,17 +141,27 @@ def integrate(
             f.write(patch)
 
         # The exact paths this patch touches, BEFORE applying anything — this
-        # (not job["filesChanged"]) drives the pathspec-limited commit below,
-        # so `git commit` touches only what THIS patch changed and never
-        # sweeps in whatever the user already had staged of their own.
+        # (not job["filesChanged"], which is the WORKTREE's view and can be
+        # stale relative to what actually landed in the patch) drives both
+        # the dirty-overlap check below and the pathspec-limited commit
+        # further down, so both act on exactly what this patch changes.
         touched_paths = _patch_paths(repo, patch_path)
+
+        if touched_paths:
+            dirty = _git(repo, "status", "--porcelain", "--", *touched_paths).stdout
+            if dirty.strip():
+                return {
+                    "task_id": task_id, "integrated": False, "reason": "dirty_overlap",
+                    "details": {"files": [line[3:] for line in dirty.splitlines() if line.strip()]},
+                    "suggestion": "commit or stash your own changes to these files before integrating",
+                }
 
         check = _git(repo, "apply", "--index", "--check", patch_path, check=False)
         if check.returncode != 0:
             return {
                 "task_id": task_id, "integrated": False, "reason": "conflict",
                 "details": {"files": _parse_conflict_files(check.stderr), "stderr": check.stderr[-2000:]},
-                "suggestion": "re-dispatch this task against the current branch (base moved), then integrate",
+                "suggestion": _conflict_suggestion(check.stderr),
             }
 
         apply = _git(repo, "apply", "--index", patch_path, check=False)
@@ -155,7 +171,7 @@ def integrate(
             return {
                 "task_id": task_id, "integrated": False, "reason": "conflict",
                 "details": {"files": _parse_conflict_files(apply.stderr), "stderr": apply.stderr[-2000:]},
-                "suggestion": "re-dispatch this task against the current branch, then integrate",
+                "suggestion": _conflict_suggestion(apply.stderr),
             }
     finally:
         Path(patch_path).unlink(missing_ok=True)
@@ -179,6 +195,7 @@ def integrate(
 
     job["integrateMode"] = mode
     job["status"] = "integrated"
+    job["finishedAt"] = time.time()
     cleaned = cleanup_job(job, delete_branch=True)
     _git(repo, "worktree", "prune", check=False)
 
@@ -192,6 +209,7 @@ def integrate(
     verification = job.get("verification") or {}
     save_job({
         "taskId": task_id, "repo": repo, "slug": job["slug"], "status": "integrated",
+        "finishedAt": job.get("finishedAt"),
         "title": job.get("title"), "integratedSha": job.get("integratedSha"),
         "integrateMode": mode, "attempt": job.get("attempt", 1),
         "batchId": job.get("batchId"), "batchKey": job.get("batchKey"),

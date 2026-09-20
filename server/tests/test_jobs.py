@@ -18,8 +18,11 @@ from jobs import (
     committed_files,
     create_worktree,
     diff_and_stat,
+    read_patch,
+    repo_worktree_error,
     salvage_worktree,
     stage_files,
+    write_patch,
 )
 from persistence import all_repos, repo_state_dir, slug_for
 
@@ -68,6 +71,22 @@ class TestCreateWorktree(JobsTestCase):
         _git(self.repo, "checkout", "-b", "feature")
         wt = create_worktree(self.repo)
         self.assertEqual(wt["baseBranch"], "feature")
+
+
+class TestRepoWorktreeError(JobsTestCase):
+    def test_real_repo_is_none(self):
+        self.assertIsNone(repo_worktree_error(self.repo))
+
+    def test_non_repo_directory_is_an_error(self):
+        not_a_repo = str(Path(self.tmp.name) / "not-a-repo")
+        Path(not_a_repo).mkdir()
+        err = repo_worktree_error(not_a_repo)
+        self.assertIsNotNone(err)
+        self.assertIn(not_a_repo, err)
+
+    def test_nonexistent_path_is_an_error(self):
+        err = repo_worktree_error(str(Path(self.tmp.name) / "does-not-exist"))
+        self.assertIsNotNone(err)
 
 
 class TestChangedFiles(JobsTestCase):
@@ -194,6 +213,22 @@ class TestBranchDescendsFromBase(JobsTestCase):
         worktree = wt["worktree"]
         _git(worktree, "reset", "--hard", f"{wt['baseSha']}~1")
         self.assertFalse(branch_descends_from_base(worktree, wt["baseSha"]))
+
+
+class TestReadPatch(JobsTestCase):
+    """review-fix §D.4: task_result inlines a patch by its own line count,
+    not diffstat — salvaged jobs have patchPath but no diffstat."""
+
+    def test_small_patch_is_returned(self):
+        path = write_patch("slug", "mk_x", "line1\nline2\nline3\n")
+        self.assertEqual(read_patch(str(path), max_lines=10), "line1\nline2\nline3\n")
+
+    def test_patch_over_the_cap_returns_none(self):
+        path = write_patch("slug", "mk_y", "\n".join(f"line{i}" for i in range(20)))
+        self.assertIsNone(read_patch(str(path), max_lines=5))
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(read_patch("/no/such/patch.diff", max_lines=100))
 
 
 class TestCommitWorktree(JobsTestCase):

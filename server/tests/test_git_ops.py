@@ -108,6 +108,7 @@ class TestCleanApply(_GitOpsCase):
         self.assertEqual(result["mode"], "commit")
         self.assertIn("commit_sha", result)
         self.assertEqual(job["status"], "integrated")
+        self.assertIsNotNone(job.get("finishedAt"))
         self.assertTrue((Path(self.repo) / "new.txt").exists())
 
         author = _git(self.repo, "log", "-1", "--format=%an <%ae>").stdout.strip()
@@ -197,6 +198,58 @@ class TestConflict(_GitOpsCase):
         self.assertEqual(_git(self.repo, "status", "--porcelain").stdout.strip(), "", "tree must be clean")
         # Branch/worktree preserved so the supervisor can re-dispatch/inspect.
         self.assertIn(job["branch"], _git(self.repo, "branch", "--list", "monkey/*").stdout)
+
+    def test_untracked_file_already_exists_gets_its_own_suggestion(self):
+        """review-fix §D.8: 'already exists in working directory' isn't a
+        moved base — re-dispatching won't fix it, so it gets an actionable
+        suggestion instead of the generic re-dispatch one.
+
+        Gitignored so `git status --porcelain` (the dirty-overlap check)
+        doesn't see it and short-circuit before `git apply --check` gets a
+        chance to report the real conflict — the same way a build artifact
+        or log file could sit there in practice."""
+        job = self._succeeded_job()
+        (Path(self.repo) / ".gitignore").write_text("new.txt\n", encoding="utf-8")
+        _git(self.repo, "add", ".gitignore")
+        _git(self.repo, "commit", "-m", "ignore new.txt")
+        (Path(self.repo) / "new.txt").write_text("an untracked, gitignored file already here\n", encoding="utf-8")
+
+        result = git_ops.integrate(job, self.repo, None, "commit", False)
+
+        self.assertFalse(result["integrated"])
+        self.assertEqual(result["reason"], "conflict")
+        self.assertIn(
+            "an untracked file at this path exists in your tree; move it or commit it, then "
+            "integrate again",
+            result["suggestion"],
+        )
+
+
+class TestDirtyOverlapUsesPatchTouchedPaths(_GitOpsCase):
+    """review-fix §D.8: the dirty-overlap check must run on the paths the
+    PATCH actually touches, not job['filesChanged'] (which reflects the
+    worktree and can be stale/wrong relative to what's really in the
+    patch)."""
+
+    def test_a_stale_filesChanged_entry_no_longer_blocks_integration(self):
+        job = self._succeeded_job()  # patch only touches new.txt
+        job["filesChanged"] = ["unrelated_stale.txt"]
+        (Path(self.repo) / "unrelated_stale.txt").write_text("dirty, but not in this patch\n", encoding="utf-8")
+
+        result = git_ops.integrate(job, self.repo, None, "commit", False)
+
+        self.assertTrue(result["integrated"])
+
+    def test_dirty_overlap_still_fires_on_a_path_the_patch_really_touches(self):
+        job = self._succeeded_job()  # patch touches new.txt
+        (Path(self.repo) / "new.txt").write_text("dirty local edit, untracked\n", encoding="utf-8")
+        job["filesChanged"] = ["some_other_path.txt"]  # deliberately wrong/stale
+
+        result = git_ops.integrate(job, self.repo, None, "commit", False)
+
+        self.assertFalse(result["integrated"])
+        self.assertEqual(result["reason"], "dirty_overlap")
+        self.assertIn("new.txt", result["details"]["files"])
 
 
 if __name__ == "__main__":

@@ -63,6 +63,7 @@ class TestSucceeded(_FinalizeCase):
         self.assertIsNotNone(job["commitSha"])
         self.assertIn("new.txt", job["filesChanged"])
         self.assertEqual(job["diffstat"]["lines"], 1)
+        self.assertIsNotNone(job.get("finishedAt"))
         self.assertTrue(Path(job["patchPath"]).exists())
         self.assertIn("new.txt", Path(job["patchPath"]).read_text(encoding="utf-8"))
         # Committed under the fixed monkey-army identity, not the user's.
@@ -89,6 +90,7 @@ class TestFailedScope(_FinalizeCase):
         self.assertEqual(job["status"], "failed_scope")
         self.assertIn("new.txt", job["scope"]["violations"])
         self.assertIsNone(job.get("commitSha"))
+        self.assertIsNotNone(job.get("finishedAt"))
         patch_text = Path(job["patchPath"]).read_text(encoding="utf-8")
         self.assertIn("OUT-OF-SCOPE", patch_text)
         self.assertIn("new.txt", patch_text)
@@ -113,6 +115,7 @@ class TestFailedOversized(_FinalizeCase):
         self.assertEqual(job["status"], "failed_oversized")
         self.assertIn("cap", job["error"])
         self.assertIsNone(job.get("commitSha"))
+        self.assertIsNotNone(job.get("finishedAt"))
 
 
 class TestFailedVerification(_FinalizeCase):
@@ -125,6 +128,7 @@ class TestFailedVerification(_FinalizeCase):
         self.assertFalse(job["verification"]["passed"])
         self.assertEqual(job["verification"]["steps"][0]["name"], "test")
         self.assertIsNone(job.get("commitSha"))
+        self.assertIsNotNone(job.get("finishedAt"))
 
     def test_verify_command_runs_after_a_passing_test_command(self):
         job = self._job(testCommand="exit 0", verifyCommand="exit 1")
@@ -133,6 +137,17 @@ class TestFailedVerification(_FinalizeCase):
 
         self.assertEqual(job["status"], "failed_verification")
         self.assertEqual([s["name"] for s in job["verification"]["steps"]], ["test", "verify"])
+
+
+class TestFailedNoChanges(_FinalizeCase):
+    def test_empty_diff_fails_instead_of_a_trivial_success(self):
+        job = self._job()  # nothing written into the worktree
+        finalize_success(job, self._cfg())
+
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error"], "worker made no changes")
+        self.assertIsNone(job.get("commitSha"))
+        self.assertIsNotNone(job.get("finishedAt"))
 
 
 class TestFailedScopeCommittedFiles(_FinalizeCase):
@@ -175,6 +190,7 @@ class TestBranchHistoryTamper(_FinalizeCase):
         self.assertEqual(job["error"], "branch history tampered: HEAD no longer descends from baseSha")
         self.assertIsNone(job.get("commitSha"))
         self.assertIsNone(job.get("patchPath"))
+        self.assertIsNotNone(job.get("finishedAt"))
 
 
 if __name__ == "__main__":
