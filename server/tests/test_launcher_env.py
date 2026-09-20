@@ -18,12 +18,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import Defaults
 from worker_launcher import (
     _SENSITIVE_ENV_SUBSTRINGS,
     _git_neutralization_env,
     build_spawn_env,
-    build_worker_args,
     is_sensitive_env_name,
 )
 
@@ -151,51 +149,6 @@ class TestBuildSpawnEnv(unittest.TestCase):
             self.assertNotIn("MONKEY_TEST_SOME_TOKEN", env)
         finally:
             del os.environ["MONKEY_TEST_SOME_TOKEN"]
-
-
-class TestBuildWorkerArgs(unittest.TestCase):
-    """env-config-spec.md: limits come straight from `Defaults` (env-only) —
-    no per-profile merge left. Per-call job overrides (maxBudgetUsd etc.,
-    set by dispatch_task's own tool arguments) still win over the env cap."""
-
-    def _resolved(self, **overrides) -> dict:
-        base = {
-            "model": "openai/combo/deepseek-main", "base_url": "http://127.0.0.1:9/v1",
-            "api_key": "k", "fallback_models": [], "prices": {"input": 0.27, "output": 1.10},
-            "model_kwargs": {"temperature": 0},
-        }
-        base.update(overrides)
-        return base
-
-    def test_env_limits_used_when_job_has_no_override(self):
-        cfg = Defaults(home=Path("/tmp"), max_budget_usd=0.75, max_tokens_total=1000)
-        job = {"worktree": "/wt", "mode": "micro"}
-        args = build_worker_args(job, cfg, self._resolved())
-        self.assertEqual(args["max_budget_usd"], 0.75)
-        self.assertEqual(args["max_tokens_total"], 1000)
-        self.assertEqual(args["model"], "openai/combo/deepseek-main")
-        self.assertEqual(args["api_base"], "http://127.0.0.1:9/v1")
-        self.assertEqual(args["api_key_env_var"], "MONKEY_9ROUTER_KEY")
-
-    def test_per_call_job_override_wins_over_env_limit(self):
-        cfg = Defaults(home=Path("/tmp"), max_budget_usd=0.75, max_tokens_total=1000)
-        job = {"worktree": "/wt", "mode": "micro", "maxBudgetUsd": 0.05, "maxTokensTotal": 200}
-        args = build_worker_args(job, cfg, self._resolved())
-        self.assertEqual(args["max_budget_usd"], 0.05)
-        self.assertEqual(args["max_tokens_total"], 200)
-
-    def test_recursion_limit_picks_micro_or_task(self):
-        cfg = Defaults(home=Path("/tmp"), recursion_limit_micro=11, recursion_limit_task=22)
-        micro_args = build_worker_args({"worktree": "/wt", "mode": "micro"}, cfg, self._resolved())
-        task_args = build_worker_args({"worktree": "/wt", "mode": "task"}, cfg, self._resolved())
-        self.assertEqual(micro_args["recursion_limit"], 11)
-        self.assertEqual(task_args["recursion_limit"], 22)
-
-    def test_prices_split_into_price_in_and_price_out(self):
-        cfg = Defaults(home=Path("/tmp"))
-        args = build_worker_args({"worktree": "/wt", "mode": "micro"}, cfg, self._resolved())
-        self.assertEqual(args["price_in"], 0.27)
-        self.assertEqual(args["price_out"], 1.10)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,6 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-import config
 import store
 
 WORKER_SCRIPT = str(Path(__file__).resolve().parent.parent / "worker" / "worker.py")
@@ -127,6 +126,16 @@ def probe(profile: dict[str, Any], ttl_s: int = 600, timeout_s: float = 30) -> d
     return result
 
 
+def invalidate_probe(profile_name: str | None = None) -> None:
+    """Drop a cached probe verdict so the next dispatch_task re-probes
+    instead of trusting a result from before a profile edit (model/api_base/
+    key change, removal, or a new default). None clears every entry."""
+    if profile_name is None:
+        _PROBE_CACHE.clear()
+    else:
+        _PROBE_CACHE.pop(profile_name, None)
+
+
 def last_probe(profile_name: str) -> dict[str, Any] | None:
     cached = _PROBE_CACHE.get(profile_name)
     if not cached:
@@ -195,34 +204,39 @@ def doctor(repo_path: str | None = None) -> list[dict[str, Any]]:
     add("git", bool(git_path), git_ver or "not found on PATH", "install git")
     add("python", True, sys.version.split()[0])
 
-    resolved = config.required_config()
-    add("env_config", not resolved["errors"],
-        "; ".join(resolved["errors"]) if resolved["errors"] else "all required variables set",
-        "export the missing/invalid MONKEY_* variables (see .env.example)")
+    cfg_store = store.load_store()
+    add("config_present", store.config_path().exists(), str(store.config_path()),
+        "configure(action='set_profile', ...) to create one")
 
-    key_available = bool(resolved.get("api_key"))
+    default_profile = cfg_store.get("default_profile")
+    add("default_profile", bool(default_profile), default_profile or "none set",
+        "configure(action='set_profile', ...) — the first profile becomes default")
+
+    profile = None
+    if default_profile:
+        try:
+            profile = store.resolve_profile(default_profile)
+        except KeyError:
+            pass
+    key_available = bool(profile and profile.get("api_key"))
     add("key_available", key_available,
-        "reachable" if key_available else "MONKEY_9ROUTER_KEY is not set",
-        "export MONKEY_9ROUTER_KEY in the shell you launch Claude Code from")
+        "reachable" if key_available else "no key resolvable for the default profile",
+        "configure(action='store_key', profile=<name>)")
 
-    profile = (
-        {"name": "default", "model": resolved["model"], "api_base": resolved["base_url"], "api_key": resolved["api_key"]}
-        if not resolved["errors"] else None
-    )
     if profile:
         probe_result = probe(profile)
-        add("probe", bool(probe_result.get("ok")), json.dumps(probe_result), "check MONKEY_9ROUTER_BASE_URL/MONKEY_WORKER_MODEL/MONKEY_9ROUTER_KEY")
+        add("probe", bool(probe_result.get("ok")), json.dumps(probe_result), "check api_base/model/key")
     else:
-        add("probe", False, "env config invalid — see env_config above", "fix the missing/invalid variables first")
+        add("probe", False, "no resolvable default profile", "configure a profile first")
 
-    if profile:
+    if profile and profile.get("api_base"):
         models = discover_models(profile)
         ok = "models" in models
         add("models_endpoint", ok,
             ", ".join(models.get("combos", [])) if ok else str(models.get("error")),
-            "check 9Router is reachable at MONKEY_9ROUTER_BASE_URL")
+            "check 9Router is reachable at api_base")
     else:
-        add("models_endpoint", False, "env config invalid — see env_config above", "fix the missing/invalid variables first")
+        add("models_endpoint", False, "no api_base on default profile", "set api_base on the profile")
 
     selftest = _worker_selftest()
     add("worker_selftest", selftest["ok"], selftest["detail"],

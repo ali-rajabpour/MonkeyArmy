@@ -5,7 +5,6 @@ model endpoint or 9Router from a test)."""
 from __future__ import annotations
 
 import json
-import os
 import sys
 import threading
 import time
@@ -142,59 +141,41 @@ class TestProbe(unittest.TestCase):
         self.assertTrue(cached["ok"])
 
 
+class TestInvalidateProbe(unittest.TestCase):
+    def test_named_invalidate_drops_only_that_profile(self):
+        handler = _handler(chat_response={"choices": [{"message": {}}]})
+        with _StubServer(handler) as base:
+            backend.probe(_profile(base, name="inv-a"), ttl_s=600)
+            backend.probe(_profile(base, name="inv-b"), ttl_s=600)
+        self.assertIsNotNone(backend.last_probe("inv-a"))
+        self.assertIsNotNone(backend.last_probe("inv-b"))
+
+        backend.invalidate_probe("inv-a")
+
+        self.assertIsNone(backend.last_probe("inv-a"))
+        self.assertIsNotNone(backend.last_probe("inv-b"))
+
+    def test_invalidate_with_no_name_clears_everything(self):
+        handler = _handler(chat_response={"choices": [{"message": {}}]})
+        with _StubServer(handler) as base:
+            backend.probe(_profile(base, name="inv-c"), ttl_s=600)
+            backend.probe(_profile(base, name="inv-d"), ttl_s=600)
+
+        backend.invalidate_probe()
+
+        self.assertIsNone(backend.last_probe("inv-c"))
+        self.assertIsNone(backend.last_probe("inv-d"))
+
+    def test_invalidate_unknown_profile_is_a_noop(self):
+        backend.invalidate_probe("never-probed")  # must not raise
+
+
 class TestBareModelForHttp(unittest.TestCase):
     def test_strips_provider_prefix(self):
         self.assertEqual(backend._bare_model_for_http("openai/combo/deepseek-main"), "combo/deepseek-main")
 
     def test_no_prefix_is_unchanged(self):
         self.assertEqual(backend._bare_model_for_http("bare-model"), "bare-model")
-
-
-class TestDoctorEnvConfig(unittest.TestCase):
-    """doctor() reads env config directly (env-config-spec.md) instead of a
-    stored profile — no store.resolve_profile call left anywhere."""
-
-    def setUp(self):
-        import tempfile
-        from unittest import mock as _mock
-
-        self._home = tempfile.TemporaryDirectory()
-        self._cleared = {k: os.environ.pop(k, None) for k in list(os.environ) if k.startswith("MONKEY_")}
-        os.environ["MONKEY_ARMY_HOME"] = self._home.name
-        self._mock = _mock
-
-    def tearDown(self):
-        for k in list(os.environ):
-            if k.startswith("MONKEY_"):
-                os.environ.pop(k, None)
-        for k, v in self._cleared.items():
-            if v is not None:
-                os.environ[k] = v
-        self._home.cleanup()
-
-    def test_missing_env_reports_env_config_check_failing(self):
-        checks = backend.doctor(repo_path=None)
-        by_name = {c["check"]: c for c in checks}
-        self.assertIn("env_config", by_name)
-        self.assertFalse(by_name["env_config"]["ok"])
-        self.assertFalse(by_name["key_available"]["ok"])
-        self.assertFalse(by_name["probe"]["ok"])
-
-    def test_valid_env_probes_the_real_endpoint(self):
-        handler = _handler(chat_response={
-            "model": "combo/deepseek-main",
-            "choices": [{"message": {"tool_calls": [{"id": "1", "function": {"name": "ping"}}]}}],
-        })
-        with _StubServer(handler) as base:
-            with self._mock.patch.dict(os.environ, {
-                "MONKEY_9ROUTER_BASE_URL": base, "MONKEY_9ROUTER_KEY": "k",
-                "MONKEY_WORKER_MODEL": "openai/combo/deepseek-main",
-            }):
-                checks = backend.doctor(repo_path=None)
-        by_name = {c["check"]: c for c in checks}
-        self.assertTrue(by_name["env_config"]["ok"])
-        self.assertTrue(by_name["key_available"]["ok"])
-        self.assertTrue(by_name["probe"]["ok"])
 
 
 if __name__ == "__main__":

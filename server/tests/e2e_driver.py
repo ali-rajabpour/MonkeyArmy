@@ -340,10 +340,12 @@ class Ctx:
         self.work_dir = work_dir
         self.monkey_home = monkey_home
         self.env = env
+        self.profile = args.profile
         self.stdio_ctx = None
         self.session_ctx = None
         self.session: ClientSession | None = None
         self.active_task_ids: set[str] = set()
+        self.api_base: str | None = None
 
     async def connect(self) -> None:
         params = StdioServerParameters(command="uv", args=["run", str(MAIN_PY)], env=self.env)
@@ -379,30 +381,6 @@ class Ctx:
         await self.disconnect()
         await self.connect()
 
-    async def dispatch_with_env_override(self, title: str, spec: str, env_overrides: dict[str, str], **kwargs: Any) -> dict:
-        """Opens a SEPARATE short-lived MCP server with `env_overrides`
-        layered over the harness's own env, dispatches exactly one task on
-        it, and tears it down. env vars are fixed for the life of a server
-        process (env-config-spec.md is env-only, no per-call profile
-        argument anymore), so testing a bad MONKEY_WORKER_MODEL or
-        MONKEY_9ROUTER_BASE_URL for a single dispatch means a second,
-        differently-configured server, not reusing self.session — every
-        other check in the phase depends on that one staying correctly
-        configured.
-        """
-        env = {**self.env, **env_overrides}
-        params = StdioServerParameters(command="uv", args=["run", str(MAIN_PY)], env=env)
-        kwargs.setdefault("repo_path", str(self.work_dir))
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                res = await session.call_tool("dispatch_task", arguments={"title": title, "spec": spec, **kwargs})
-                text = res.content[0].text if res.content else "{}"
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError:
-                    return {"_raw": text, "_isError": res.isError}
-
     async def call(self, tool: str, **kwargs: Any) -> dict:
         assert self.session is not None
         res = await self.session.call_tool(tool, arguments=kwargs)
@@ -417,6 +395,7 @@ class Ctx:
 
     async def dispatch(self, title: str, spec: str, **kwargs: Any) -> dict:
         kwargs.setdefault("repo_path", str(self.work_dir))
+        kwargs.setdefault("profile", self.profile)
         r = await self.call("dispatch_task", title=title, spec=spec, **kwargs)
         tid = r.get("task_id")
         if tid:
@@ -509,11 +488,11 @@ async def phase1(ctx: Ctx) -> None:
         json.dumps(status.get("last_doctor_at")),
     )
 
-    r = await ctx.call("configure", action="discover_models")
+    r = await ctx.call("configure", action="discover_models", profile=ctx.profile)
     combos = r.get("combos") or []
     record("T1.1 discover_models lists the combo", any(args.model.endswith(c) or c in args.model for c in combos), json.dumps(r))
 
-    r = await ctx.call("configure", action="probe")
+    r = await ctx.call("configure", action="probe", profile=ctx.profile)
     record("T1.1 probe ok", r.get("ok") is True, json.dumps(r))
     record("T1.1 probe tool_calling confirmed", r.get("tool_calling") == "confirmed", json.dumps(r))
 
@@ -619,36 +598,23 @@ async def phase1(ctx: Ctx) -> None:
             record("T1.4 cmp reports no differences", cmp_out.returncode == 0, cmp_out.stdout + cmp_out.stderr)
         await ctx.cleanup(task_s)
 
-    # T1.5 -- bad model name: probe fails, dispatch_task refuses, no worktree created.
-    # A second, short-lived server with MONKEY_WORKER_MODEL swapped -- env vars are
-    # fixed for the life of a server process, so this can't reuse ctx.session.
+    # T1.5 -- bad model name: probe fails, dispatch_task refuses, no worktree created
+    await ctx.call(
+        "configure", action="set_profile", name="e2e-badmodel",
+        model="openai/combo/does-not-exist-xyz", api_base=ctx.api_base,
+        api_key_env_var=args.api_key_env_var,
+    )
     wt_before = _git(ctx.work_dir, "worktree", "list", "--porcelain").stdout.count("worktree ")
-    r = await ctx.dispatch_with_env_override(
+    r = await ctx.call("configure", action="probe", profile="e2e-badmodel")
+    record("T1.5 probe fails for a bad model name", r.get("ok") is False, json.dumps(r))
+    r = await ctx.dispatch(
         "T1.5 bad model dispatch",
         spec_text("This dispatch must be refused before any worktree is created.", args, None),
-        {"MONKEY_WORKER_MODEL": "openai/combo/does-not-exist-xyz"},
-        test_command=None,
+        test_command=None, profile="e2e-badmodel",
     )
     record("T1.5 dispatch_task refuses", "task_id" not in r and bool(r.get("error")), json.dumps(r))
     wt_after = _git(ctx.work_dir, "worktree", "list", "--porcelain").stdout.count("worktree ")
     record("T1.5 no worktree created", wt_after == wt_before, f"before={wt_before} after={wt_after}")
-
-    # T1.5b -- a missing required variable refuses the same way, naming it,
-    # and still creates no worktree.
-    wt_before = _git(ctx.work_dir, "worktree", "list", "--porcelain").stdout.count("worktree ")
-    r = await ctx.dispatch_with_env_override(
-        "T1.5b missing required variable",
-        spec_text("This dispatch must be refused before any worktree is created.", args, None),
-        {"MONKEY_WORKER_MODEL": ""},
-        test_command=None,
-    )
-    record(
-        "T1.5b missing MONKEY_WORKER_MODEL refuses and names it",
-        "task_id" not in r and "MONKEY_WORKER_MODEL" in (r.get("error") or ""),
-        json.dumps(r),
-    )
-    wt_after = _git(ctx.work_dir, "worktree", "list", "--porcelain").stdout.count("worktree ")
-    record("T1.5b no worktree created", wt_after == wt_before, f"before={wt_before} after={wt_after}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -994,12 +960,16 @@ async def phase4(ctx: Ctx) -> None:
     s.bind(("127.0.0.1", 0))
     dead_port = s.getsockname()[1]
     s.close()
+    await ctx.call(
+        "configure", action="set_profile", name="e2e-deadport",
+        model=args.model, api_base=f"http://127.0.0.1:{dead_port}/v1",
+        api_key_env_var=args.api_key_env_var,
+    )
     wt_before = _git(ctx.work_dir, "worktree", "list", "--porcelain").stdout.count("worktree ")
-    r = await ctx.dispatch_with_env_override(
+    r = await ctx.dispatch(
         "T4.1 unreachable endpoint",
         "This dispatch must be refused with a clear connection error before any worktree is created.",
-        {"MONKEY_9ROUTER_BASE_URL": f"http://127.0.0.1:{dead_port}/v1"},
-        test_command=None,
+        test_command=None, profile="e2e-deadport",
     )
     record("T4.1 unreachable endpoint refused with a clear error", "task_id" not in r and bool(r.get("error")), json.dumps(r))
     wt_after = _git(ctx.work_dir, "worktree", "list", "--porcelain").stdout.count("worktree ")
@@ -1194,13 +1164,11 @@ async def phase4(ctx: Ctx) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Offline (or real-endpoint) end-to-end proof of the monkey-army plugin.")
-    p.add_argument("--api-base", default=os.environ.get("MONKEY_9ROUTER_BASE_URL"),
-                    help="OpenAI-compatible endpoint base URL; defaults to $MONKEY_9ROUTER_BASE_URL "
-                         "(required unless --fake).")
+    p.add_argument("--api-base", default=None, help="OpenAI-compatible endpoint base URL (required unless --fake).")
     p.add_argument("--model", default=None, help="litellm model string, e.g. openai/combo/deepseek-main.")
     p.add_argument("--api-key-env-var", default="MONKEY_9ROUTER_KEY",
-                    help="Local env var holding the real API key to forward into the spawned "
-                         "server's MONKEY_9ROUTER_KEY (only used without --fake).")
+                    help="Env var to read the API key from -- never accepted as an argument.")
+    p.add_argument("--profile", default="e2e")
     p.add_argument("--phases", default="1,2,4")
     p.add_argument("--repo", default=None,
                     help="Path to an existing git repo copy; default: makes its own /tmp copy of "
@@ -1239,32 +1207,36 @@ async def _run(args: argparse.Namespace) -> int:
     print(f"repo: {work_dir}")
 
     fake_server = fake_thread = None
-    base_url = args.api_base
+    api_base = args.api_base
     api_key: str | None
     if args.fake:
         fake_server, fake_thread, port = start_fake_server(args.model)
-        base_url = f"http://127.0.0.1:{port}/v1"
+        api_base = f"http://127.0.0.1:{port}/v1"
         api_key = "dummy-fake-key"
-        print(f"fake LLM listening on {base_url}")
+        print(f"fake LLM listening on {api_base}")
     else:
         api_key = os.environ.get(args.api_key_env_var)
         if not api_key:
             print(f"error: {args.api_key_env_var} is not set in the environment", file=sys.stderr)
             return 2
 
-    # env-config-spec.md: the server takes every user-set value from its own
-    # process env -- no configure(action='set_profile'/'store_key') left to
-    # call, so this dict IS the configuration for the whole run.
-    env = {
-        **os.environ, "MONKEY_ARMY_HOME": str(monkey_home), "PYTHONDONTWRITEBYTECODE": "1",
-        "MONKEY_9ROUTER_BASE_URL": base_url, "MONKEY_9ROUTER_KEY": api_key,
-        "MONKEY_WORKER_MODEL": args.model,
-        "MONKEY_PRICE_INPUT_PER_MTOK": "0.27", "MONKEY_PRICE_OUTPUT_PER_MTOK": "1.10",
-    }
+    env = {**os.environ, "MONKEY_ARMY_HOME": str(monkey_home), "PYTHONDONTWRITEBYTECODE": "1"}
     ctx = Ctx(args, work_dir, monkey_home, env)
+    ctx.api_base = api_base
 
     try:
         await ctx.connect()
+        r = await ctx.call(
+            "configure", action="set_profile", name=ctx.profile, model=args.model, api_base=api_base,
+            api_key_env_var=args.api_key_env_var, price_input_per_mtok=0.27, price_output_per_mtok=1.10,
+        )
+        if not r.get("saved"):
+            print(f"error: could not configure profile: {r}", file=sys.stderr)
+            return 2
+        r = await ctx.call("configure", action="store_key", profile=ctx.profile, key=api_key)
+        if not r.get("stored_as"):
+            print(f"error: could not store the API key: {r}", file=sys.stderr)
+            return 2
 
         if 1 in phases:
             print("\n=== Phase 1 ===")

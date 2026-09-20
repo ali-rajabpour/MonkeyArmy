@@ -11,7 +11,7 @@ writing the code — you're paying expensive tokens either way, so write the cod
 A task is well-sized when it touches ~1 file (rarely 2), changes roughly **20–200 lines**, has
 one acceptance command, and every design decision is already made before dispatch. Below ~20
 lines, the spec-to-code ratio breaks the granularity rule. Above ~200 lines (or the configured
-`MONKEY_MAX_DIFF_LINES` cap, default 300), the worker is more likely to make an undecided design choice
+`max_diff_lines` cap, default 300), the worker is more likely to make an undecided design choice
 along the way, which forces a reject-and-retype cycle — split the task instead.
 
 ## Polling is the hidden cost
@@ -27,8 +27,8 @@ change (done, needs input, or timeout), turning what would be N expensive round 
 |---|---|---|
 | Acceptance (tests/verify/lint pass) | Server re-runs the commands (§ Verification pipeline) | — |
 | File scope (`allowed_files`) | Server compares changed files against the glob list | — |
-| Diff size (`MONKEY_MAX_DIFF_LINES`) | Server rejects (`failed_oversized`) before verification | — |
-| Cost cap (`max_budget_usd` per call, `MONKEY_MAX_BUDGET_USD` default) | Worker stops itself once tracked spend exceeds the cap | Accuracy depends on pricing being known (`priced`) |
+| Diff size (`max_diff_lines`) | Server rejects (`failed_oversized`) before verification | — |
+| Cost cap (`max_budget_usd`) | Worker stops itself once tracked spend exceeds the cap | Accuracy depends on pricing being known (`priced`) |
 | Token cap (`max_tokens_total`) | Worker stops itself; works even when pricing is unknown | — |
 | Wall-clock / stall / per-command timeout | Launcher watchdog kills the process | — |
 | Task granularity (20–200 lines, 1 file) | Nothing — it's a rule of thumb for the supervisor | Entirely advisory; the caps above are the backstop, not this rule |

@@ -12,11 +12,11 @@ expensive kind. **Never spend your tokens typing implementation code.** Break th
 micro-tasks so small a monkey cannot get them wrong, hand each to a cheap worker through the
 `monkeys` MCP tools, and review what comes back like a senior engineer signing off a junior's PR.
 
-## 0. Environment check (first thing, every session)
-Call `configure(action="status")`. If any required variable is missing or invalid, stop: tell the
-user the exact `export` line(s) needed (see `.env.example`) and that Claude Code needs a restart
-to pick them up. Configuration is environment variables only — there is no profile to pick and
-nothing here to set on the user's behalf. If `doctor` has never run on this machine, run
+## 0. Profile check (first thing, every session)
+Call `configure(action="status")`. If there is no default profile, or the user has not chosen one
+in this session, call `configure(action="discover_models", profile=<default>)` and **ask the user
+which combo/profile the monkeys should use** (and whether they want a fallback). Never change
+configuration unless the user explicitly asks. If `doctor` has never run on this machine, run
 `configure(action="doctor", repo_path=<repo>)` once and fix what it flags before dispatching.
 
 ## 1. Assessment mode (advice only)
@@ -61,7 +61,7 @@ put all independent dispatches in the same turn. Check `preflight`: a non-zero e
 tests target code that doesn't exist yet, but if the *runner* is broken (module not found,
 unknown option) fix `test_command` and re-dispatch — never let a monkey fight a broken gate.
 Use `mode="micro"` (default). Use `mode="task"` only for a coherent multi-file lot you
-deliberately chose not to split.
+deliberately chose not to split. Do not pass `profile` unless the user asked for a specific one.
 
 ### 2.4 Wait and supervise (never idle-poll)
 Call `wait_for_tasks(task_ids)` — it returns on the first state change. Every extra poll turn
@@ -111,10 +111,8 @@ only durable operational facts ("tests need `uv run pytest -q`").
 - Never trust the worker's summary or claimed success; the server's `verification` and your
   reading of the diff decide.
 - Never approve an unread patch; never integrate an unapproved task (the server refuses anyway).
-- Never call mutating `configure` actions — there are none left to call unasked (`configure` is
-  read-only plus `add_note`/`prune`). Never change environment configuration as a reaction to a
-  failing task — report and let the user decide; configuration changes need a Claude Code
-  restart.
+- Never call mutating `configure` actions unless the user asked in this conversation; never
+  switch profiles as a reaction to a failing task — report and let the user decide.
 - Never read `.jsonl` logs or worktree files directly; use `task_result`/`task_progress`.
 - Never leave worktrees or `monkey/*` branches behind; `finish` or `cleanup_task` every task.
 - Workers never push; you never push either — the user owns `git push`.

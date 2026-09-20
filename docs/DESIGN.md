@@ -55,49 +55,10 @@ I6. Integration never leaves the user's tree in a half-merged state: it dry-runs
     (`git apply --check`) and either applies fully or reports a conflict having changed nothing.
 I7. Every worker run has hard limits: recursion, wall-clock, stall, per-command timeout, USD
     budget and a token budget (so the cap works even when pricing is unknown).
-I8. Secrets never enter the model conversation: the key is read from the environment by the
-    server and handed only to the worker subprocess. No tool accepts a key argument; nothing
-    prints it; `configure(status)` reports only whether it is set.
-I9. Configuration is environment variables only, read fresh on every call (no cached snapshot);
-    there is nothing left for a tool to mutate. A missing or invalid required variable is a loud
-    error naming the variable, never a fallback.
+I8. Secrets never enter the model conversation (elicitation for keys), never reach worker shell
+    commands (env filtering), and the worker process receives only its own provider key.
+I9. Configuration changes happen only on explicit user request (skill rule + tool descriptions).
 I10. Licensing & attribution: MIT; `NOTICE` credits cc-delegate and third-party components.
-
-## Configuration
-
-Every user-set value is an environment variable, read fresh on each tool call — no profiles, no
-`config.json`, no `credentials.json`, no elicitation dialog, no per-call `profile` argument. A
-missing or invalid required variable is an error naming the variable, reported as one list when
-several are missing. Per-call tool arguments that already exist (`max_budget_usd`,
-`max_tokens_total`, `timeout_s`, integrate `mode`) still win for that one call — they are the
-supervisor's explicit instruction for that task, not user configuration.
-
-**Required** (no defaults; absence or an invalid value is an error):
-
-| Variable | Meaning | Validation |
-|---|---|---|
-| `MONKEY_9ROUTER_BASE_URL` | OpenAI-compatible endpoint | must start `http://` or `https://` |
-| `MONKEY_9ROUTER_KEY` | worker API key; passed to the worker process only | non-empty |
-| `MONKEY_WORKER_MODEL` | litellm model string, e.g. `openai/combo/deepseek-main` | must contain `/`; `litellm:` prefix rejected |
-
-**Optional worker settings** (code default; env is the only override): `MONKEY_FALLBACK_MODELS`,
-`MONKEY_PRICE_INPUT_PER_MTOK`, `MONKEY_PRICE_OUTPUT_PER_MTOK`, `MONKEY_MODEL_KWARGS_JSON`.
-
-**Optional limits** (code default; env is the only override — no clamping, no ignoring):
-`MONKEY_MAX_BUDGET_USD`, `MONKEY_MAX_TOKENS_TOTAL`, `MONKEY_TIMEOUT_S`, `MONKEY_STALL_S`,
-`MONKEY_COMMAND_TIMEOUT_S`, `MONKEY_ASK_TIMEOUT_S`, `MONKEY_RECURSION_LIMIT_MICRO`,
-`MONKEY_RECURSION_LIMIT_TASK`, `MONKEY_RUBRIC_MAX_ITERATIONS_TASK`, `MONKEY_MAX_DIFF_LINES`,
-`MONKEY_INTEGRATE_MODE`, `MONKEY_VERIFY_TIMEOUT_S`, `MONKEY_WAIT_TIMEOUT_S` (hard cap 170s, not
-configurable), `MONKEY_PREFLIGHT_TIMEOUT_S`, `MONKEY_PROBE_TTL_S`, `MONKEY_CONVENTIONS_MAX_CHARS`,
-`MONKEY_NOTES_MAX_CHARS`, `MONKEY_ARMY_HOME`. Full defaults and descriptions in `.env.example`.
-
-**Set by the server for the worker subprocess only** — never set by the user:
-`MONKEY_WORKER_API_KEY`, `MONKEY_COMM_DIR`, `MONKEY_ASK_TIMEOUT_S` (resolved value), plus the git
-neutralisation block (see Security model).
-
-`configure` keeps only read-only and repo-housekeeping actions: `status` (resolved config with
-secrets masked — `MONKEY_9ROUTER_KEY` reported as set/not set, never its value), `doctor`,
-`probe`, `discover_models`, `add_note`, `prune`.
 
 ## Data model
 
@@ -106,44 +67,36 @@ State lives entirely under `~/.monkey-army/` (override `MONKEY_ARMY_HOME`), keye
 inside the user's repository. Per-repo: `notes.md`, `batches/<id>.json`, `jobs/<task_id>.json`,
 `logs/<task_id>.jsonl`, `comm/<task_id>/`, `patches/<task_id>.diff`,
 `worktrees/<task_id>/` (the actual git worktree, branch `monkey/<task_id>`). Global:
-`repos.json` (slug → absolute repo path, for restart lookup), `statusline`, `meta.json`
-(`last_doctor_at`). No configuration is stored here — see Configuration above.
+`config.json` (profiles + defaults, no secrets), `credentials.json` (mode 0600), `repos.json`
+(slug → absolute repo path, for restart lookup), `statusline`.
 
-A job record carries everything about one task attempt: spec, scope (`allowedFiles`), model,
-status, review verdict, verification results, scope/diffstat, patch location, cost and token
-counts, and timestamps. A batch manifest links task keys to task ids and dependency order, and
-accumulates a report on finish.
+A job record carries everything about one task attempt: spec, scope (`allowedFiles`),
+model/profile, status, review verdict, verification results, scope/diffstat, patch location,
+cost and token counts, and timestamps. A batch manifest links task keys to task ids and
+dependency order, and accumulates a report on finish.
 
 ## Task lifecycle
 
 ```
 running --(worker done)--> verifying --> succeeded | failed_scope | failed_oversized | failed_verification
-running --(worker crashes/errors)--> failed
 running --(worker asks)--> needs_input --(answer_worker)--> running
 running --(no progress)--> timeout | cancelled
 any TERMINAL --(review_task)--> reviewed (verdict recorded on the job)
 succeeded + approved --(integrate_task)--> integrated
 ```
 
-Full status set (single source of truth in `persistence.py`): active — `running`, `needs_input`,
-`verifying`; terminal — `succeeded`, `failed`, `failed_verification`, `failed_scope`,
-`failed_oversized`, `timeout`, `cancelled`, `integrated`. Every terminal status sets
-`finishedAt`. `verifying` and `needs_input` are transient states the server sets; only the
-server moves a job into `succeeded`/`failed_*` (§ Verification pipeline). Only the supervisor
-moves a job through `review_task` and `integrate_task` — no other path reaches `integrated`.
+`verifying` and `needs_input` are transient states the server sets; only the server moves a job
+into `succeeded`/`failed_*` (§ Verification pipeline). Only the supervisor moves a job through
+`review_task` and `integrate_task` — no other path reaches `integrated`.
 
 ## Verification pipeline
 
 After the worker exits (or is salvaged on failure), the server — not the worker, not an LLM
-grader — runs a fixed pipeline in the worktree. First it asserts `HEAD` still descends from
-`baseSha` (`failed_scope` otherwise — a tampered history can't be trusted to scope-check or diff
-correctly). Then it computes changed files as the union of uncommitted porcelain *and* anything
-already committed since `baseSha` (workers may not run `git commit`/`git reset`, but scope still
-covers committed files), checks them against `allowedFiles` (scope), stages the in-scope ones,
-diffs against the base commit, fails (`failed`, "worker made no changes") on an empty diff,
-rejects (`failed_oversized`) if the diff exceeds the configured line cap, then runs
-`testCommand`, `verifyCommand`, `lintCommand` in that order, stopping at the first failure. Only
-if every step passes does the job become `succeeded` and get committed in the worktree.
+grader — runs a fixed pipeline in the worktree: compute changed files, check them against
+`allowedFiles` (scope), stage the in-scope ones, diff against the base commit, reject if the
+diff exceeds the configured line cap, then run `testCommand`, `verifyCommand`, `lintCommand` in
+that order, stopping at the first failure. Only if every step passes does the job become
+`succeeded` and get committed in the worktree.
 
 deepagents ships a `RubricMiddleware` that can have an LLM grade a task against a rubric. This
 plugin does not use it as the pass/fail gate in `mode="micro"`: an LLM verdict is a claim, not a
@@ -157,11 +110,9 @@ claimed status is recorded for the record (`workerClaimedStatus`) but never deci
 there is no in-progress git operation and no dirty overlap with the files the task touched. It
 builds a fresh patch (`git diff --binary --no-renames <baseSha> <branch>`, covering every attempt's commits),
 dry-runs it with a strict `git apply --index --check`, and only if that succeeds applies it for
-real with `git apply --index`. On `mode="commit"` it commits with the user's own git identity,
-scoped to only the patch's own paths (`git commit -- <paths>`, read from the applied patch via
-`git apply --numstat -z`, never a plain `git commit` that would sweep in anything else the user
-had staged); on `mode="stage"` it leaves the changes staged. Either way the worktree and
-`monkey/*` branch are removed immediately after.
+real with `git apply --index`. On `mode="commit"` it commits with the user's own git identity;
+on `mode="stage"` it leaves the changes staged. Either way the worktree and `monkey/*` branch
+are removed immediately after.
 
 `git apply --check` was chosen over `git merge --squash` because it is stateless: a failed dry
 run modifies nothing (needed for I6), while a squash merge touches the index and can leave the
@@ -181,19 +132,14 @@ that is what both the dry run and the real apply use.
 
 Enforced at the **tool layer** (workers cannot execute it in the first place): a git-command
 allowlist restricts workers to read-only and worktree-local subcommands (`status diff log show
-add blame grep ls-files rev-parse apply rm mv restore`, restricted `branch`); `commit` and
-`reset` are blocked outright (the server commits on `integrate_task`, not the worker — this also
-keeps the scope and base-ancestry checks meaningful; see Verification pipeline); everything that
-touches shared refs or credentials (`push fetch pull merge rebase stash tag remote worktree
-checkout switch clone` etc.) is blocked with an explanation. `-c`, `-C`, `--git-dir`,
-`--work-tree`, `--exec-path` and `--namespace` are blocked outright too — a command-line `-c`
-outranks the `GIT_CONFIG_*` environment block below, and the path options point git at another
-repository (`--no-pager`/`-p`/`--paginate` stay allowed). The allowlist also catches wrappers and
-indirection: `env git ...`, `xargs git ...`, combined shell invocations (`sh -lc "..."`), and
-`git` reached through `$(...)` or backtick command substitution. It fails closed — a quoted
-argument that merely *mentions* `git` alongside whitespace gets re-checked as if it might be a
-command, so a benign case like `grep "git push"` is blocked too. That is an accepted false
-positive: refusing a safe command is cheap, missing a dangerous one is not.
+add blame grep ls-files rev-parse apply rm mv restore`, restricted `branch`/`reset`, `commit`);
+everything that touches shared refs or credentials (`push fetch pull merge rebase stash tag
+remote worktree checkout switch clone` etc.) is blocked with an explanation. The allowlist also
+catches wrappers and indirection: `env git ...`, `xargs git ...`, combined shell invocations
+(`sh -lc "..."`), and `git` reached through `$(...)` or backtick command substitution. It fails
+closed — a quoted argument that merely *mentions* `git` alongside whitespace gets re-checked as
+if it might be a command, so a benign case like `grep "git push"` is blocked too. That is an
+accepted false positive: refusing a safe command is cheap, missing a dangerous one is not.
 
 Enforced by **environment** (belt and braces even if the tool-layer check were bypassed): the
 launcher injects a `GIT_CONFIG_*` block with `protocol.allow=never`, so every transport (file,
@@ -324,17 +270,6 @@ with deepagents 0.7.0a6.
   `filesChanged`, because a multi-attempt patch can touch a different set.
 - `batch(status|finish)` resolves `repo_path` from the manifest when it is omitted, which is how
   the skill calls it.
-
-2026-09-20 (env-only configuration):
-- Replaced `config.json`/`credentials.json`, profiles, and the `configure(set_profile,
-  store_key, set_default, ...)` elicitation flow with environment variables as the single
-  configuration source. Reason: the previous model had two places a value could come from (a
-  saved profile and an env fallback) with resolution order to remember and get wrong; the user
-  wants one place, fail loud, no fallbacks. A missing or invalid required variable is now an
-  error naming the variable, never a silent default or a second source to check.
-  `dispatch_task(profile=...)` and every `profile` field in jobs/reports/statusline are gone
-  along with it. `configure` keeps only read-only/housekeeping actions: `status`, `doctor`,
-  `probe`, `discover_models`, `add_note`, `prune`.
 
 ## VERIFY table (plan §14)
 
