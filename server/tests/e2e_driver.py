@@ -1164,7 +1164,9 @@ async def phase4(ctx: Ctx) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Offline (or real-endpoint) end-to-end proof of the monkey-army plugin.")
-    p.add_argument("--api-base", default=None, help="OpenAI-compatible endpoint base URL (required unless --fake).")
+    p.add_argument("--api-base", default=os.environ.get("MONKEY_9ROUTER_BASE_URL"),
+                    help="OpenAI-compatible endpoint base URL; defaults to $MONKEY_9ROUTER_BASE_URL "
+                         "(required unless --fake).")
     p.add_argument("--model", default=None, help="litellm model string, e.g. openai/combo/deepseek-main.")
     p.add_argument("--api-key-env-var", default="MONKEY_9ROUTER_KEY",
                     help="Env var to read the API key from -- never accepted as an argument.")

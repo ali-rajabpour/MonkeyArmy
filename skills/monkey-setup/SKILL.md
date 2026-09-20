@@ -19,6 +19,8 @@ reachability. Fix anything it flags (report it, don't silently continue) before 
 
 ## 2. 9Router URL
 Ask the user for their 9Router URL. Default if they have none ready: `http://localhost:20128/v1`.
+If `MONKEY_9ROUTER_BASE_URL` is set in the environment, offer that value as the default instead
+(`configure(action="status")` reports the resolved `api_base`).
 
 ## 3. Profile name
 Ask what to call the profile. Default: `deepseek-combo`.

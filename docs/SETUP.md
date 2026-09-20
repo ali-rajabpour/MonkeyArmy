@@ -45,6 +45,12 @@ Manual equivalent, if you prefer explicit commands in chat:
 
 Config lives in `~/.monkey-army/config.json`; the key in `~/.monkey-army/credentials.json` (0600).
 
+Environment fallbacks (optional, see `.env.example`): `MONKEY_9ROUTER_BASE_URL` supplies the
+endpoint for a profile that has no `api_base` of its own, and `MONKEY_9ROUTER_KEY` supplies the
+key when `credentials.json` has none. A profile's own `api_base` always wins. The MCP server
+inherits Claude Code's environment, so an `export` only reaches the workers if Claude Code was
+started from that shell afterwards.
+
 ## 5. Try it on a scratch repository
 ```bash
 cp -r <plugin>/examples/toy-repo /tmp/toy && cd /tmp/toy && git init -b main && git add . && git commit -m init

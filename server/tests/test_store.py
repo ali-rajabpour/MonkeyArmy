@@ -5,6 +5,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -54,6 +55,14 @@ class TestProfiles(StoreTestCase):
             store.set_profile("bad", "litellm:openai/combo-deepseek")
         self.assertIn("litellm:", str(cm.exception))
         self.assertIn("drop", str(cm.exception))
+
+    def test_api_base_falls_back_to_env_then_profile_wins(self):
+        store.set_profile("noBase", "openai/combo/x", api_key_env_var="K")
+        with mock.patch.dict(os.environ, {store.API_BASE_ENV_VAR: "http://env.example/v1"}):
+            self.assertEqual(store.resolve_profile("noBase")["api_base"], "http://env.example/v1")
+            store.set_profile("own", "openai/combo/x", api_base="http://own.example/v1")
+            self.assertEqual(store.resolve_profile("own")["api_base"], "http://own.example/v1")
+        self.assertIsNone(store.resolve_profile("noBase")["api_base"])
 
     def test_api_base_must_be_http(self):
         with self.assertRaises(ValueError):

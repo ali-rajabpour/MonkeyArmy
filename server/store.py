@@ -43,6 +43,10 @@ from persistence import (
 _LEGACY_PREFIX_RE = re.compile(r"^litellm:", re.IGNORECASE)
 
 
+# Machine-level fallback for a profile without its own api_base (§7.1).
+API_BASE_ENV_VAR = "MONKEY_9ROUTER_BASE_URL"
+
+
 def config_path() -> Path:
     return home_dir() / "config.json"
 
@@ -272,6 +276,11 @@ def resolve_profile(name: str | None = None) -> dict[str, Any]:
     env_var = chosen.get("api_key_env_var")
     api_key = (get_credential(env_var) or os.environ.get(env_var)) if env_var else None
 
+    # A profile's own api_base always wins; MONKEY_9ROUTER_BASE_URL is the
+    # machine-level fallback so a profile can be moved between hosts (or set
+    # up before the URL is known) without editing config.json.
+    api_base = chosen.get("api_base") or os.environ.get(API_BASE_ENV_VAR) or None
+
     defaults = load_defaults()
     limits: dict[str, Any] = {field: getattr(defaults, field) for field in _LIMIT_FIELDS}
     limits.update(chosen.get("limits") or {})
@@ -279,7 +288,7 @@ def resolve_profile(name: str | None = None) -> dict[str, Any]:
     return {
         "name": chosen_name,
         "model": chosen["model"],
-        "api_base": chosen.get("api_base"),
+        "api_base": api_base,
         "api_key_env_var": env_var,
         "api_key": api_key,
         "fallback_models": chosen.get("fallback_models") or [],
