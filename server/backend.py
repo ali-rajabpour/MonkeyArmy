@@ -172,7 +172,10 @@ def probe(profile: dict[str, Any], ttl_s: int = 600, timeout_s: float = 30) -> d
         return result
 
     body = {
-        "model": _bare_model_for_http(profile["model"]), "max_tokens": 16, "temperature": 0,
+        # 64, not 16: a tool call costs more tokens than a 16-token budget
+        # allows, and a truncated one reads exactly like a model that cannot
+        # call tools at all (verified against a live router).
+        "model": _bare_model_for_http(profile["model"]), "max_tokens": 64, "temperature": 0,
         "messages": [{"role": "user", "content": "Call the tool `ping` with x=1."}],
         "tools": [{
             "type": "function",
@@ -196,11 +199,15 @@ def probe(profile: dict[str, Any], ttl_s: int = 600, timeout_s: float = 30) -> d
         return result
 
     choices = resp.get("choices") or []
-    tool_calls = bool(choices) and bool((choices[0].get("message") or {}).get("tool_calls"))
+    first = choices[0] if choices else {}
+    # Either signal counts: some routers return the parsed `tool_calls` array,
+    # others only set finish_reason="tool_calls" after reshaping the payload.
+    tool_calls = bool((first.get("message") or {}).get("tool_calls"))
+    finished_on_tool_call = first.get("finish_reason") == "tool_calls"
     result = {
         "ok": bool(choices), "latency_ms": latency_ms,
         "model_reported": resp.get("model"),
-        "tool_calling": "confirmed" if tool_calls else "not_observed",
+        "tool_calling": "confirmed" if (tool_calls or finished_on_tool_call) else "not_observed",
         "usage_present": "usage" in resp,
     }
     if not choices:

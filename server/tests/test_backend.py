@@ -211,5 +211,40 @@ class TestResponseParsing(unittest.TestCase):
         self.assertIn("RuntimeError: boom", result["error"])
 
 
+class TestProbeToolCallingSignals(unittest.TestCase):
+    """A live router truncated the tool call at max_tokens=16 and reported it
+    as a model that cannot call tools; another returned finish_reason without
+    a parsed tool_calls array."""
+
+    def _probe(self, response):
+        with mock.patch.object(backend, "_request", return_value=(200, response)):
+            return backend.probe(
+                {"name": "p", "model": "openai/coder", "api_base": "http://x/v1"}, ttl_s=0
+            )
+
+    def test_parsed_tool_calls(self):
+        r = self._probe({"choices": [{"message": {"tool_calls": [{"id": "1"}]}}], "usage": {}})
+        self.assertEqual(r["tool_calling"], "confirmed")
+
+    def test_finish_reason_only(self):
+        r = self._probe({"choices": [{"message": {"content": ""}, "finish_reason": "tool_calls"}]})
+        self.assertEqual(r["tool_calling"], "confirmed")
+
+    def test_plain_answer_is_not_observed(self):
+        r = self._probe({"choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]})
+        self.assertEqual(r["tool_calling"], "not_observed")
+
+    def test_budget_is_large_enough_for_a_tool_call(self):
+        captured = {}
+
+        def fake(url, key, *, method="GET", body=None, timeout_s=10):
+            captured.update(body or {})
+            return 200, {"choices": [{"message": {"tool_calls": [{"id": "1"}]}}]}
+
+        with mock.patch.object(backend, "_request", side_effect=fake):
+            backend.probe({"name": "q", "model": "openai/coder", "api_base": "http://x/v1"}, ttl_s=0)
+        self.assertGreaterEqual(captured["max_tokens"], 64)
+
+
 if __name__ == "__main__":
     unittest.main()
