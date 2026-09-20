@@ -21,7 +21,8 @@ and reviewed and merged back by the supervisor — never idle tokens spent on ty
 2. Have 9Router running with a combo (DeepSeek + fallbacks) and an API key.
 3. `/plugin marketplace add ali-rajabpour/MonkeyArmy` then
    `/plugin install monkey-army@monkey-army`.
-4. Say **"monkeys: set up"** — no restart, no env vars, key never appears in chat.
+4. Export `MONKEY_9ROUTER_BASE_URL`, `MONKEY_9ROUTER_KEY`, `MONKEY_WORKER_MODEL` (see
+   [`.env.example`](.env.example)), restart Claude Code, then run `/monkey-setup` to verify.
 5. Try it on a scratch repo: `/monkey-army add a subtract(a, b) function to calc/__init__.py...`.
 
 Full walkthrough: [`docs/SETUP.md`](docs/SETUP.md).
@@ -48,10 +49,14 @@ Workers never touch your working tree: every write happens in a disposable git
 worktree outside your repository, and a task only merges after the server
 re-runs the acceptance command itself and the supervisor gives an explicit
 approval — there is no path around either gate. Git is neutralised for workers
-at the tool layer and by environment (no push, fetch, merge, rebase, or
-credentials), and secrets are filtered out of worker shell commands. Be aware
-that shell commands the worker runs inside its worktree are not sandboxed
-beyond that — this is process isolation and gate enforcement, not a container.
+at the tool layer (an allowlist blocks push/fetch/merge/rebase/checkout and
+similar, plus `git commit`/`git reset`, and `-c`/`-C`/`--git-dir`/`--work-tree`/
+`--exec-path`/`--namespace`) and by environment (`protocol.allow=never`, no
+credential helper, SSH agent removed), and secrets are filtered out of worker
+shell commands. Integration only ever applies the patch's own paths, dry-runs
+before writing anything, and refuses on an empty diff. Be aware that shell
+commands the worker runs inside its worktree are not sandboxed beyond that —
+this is process isolation and gate enforcement, not a container.
 
 ## Docs
 

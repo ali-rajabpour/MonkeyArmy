@@ -9,11 +9,21 @@ Set up the scratch repo once per validation pass:
 cp -r examples/toy-repo /tmp/toy && cd /tmp/toy && git init -b main && git add . && git commit -m init
 ```
 
-Run the existing test suite (from the plugin repo root) with:
+Export the required environment variables before anything else (see `.env.example`):
+`MONKEY_9ROUTER_BASE_URL`, `MONKEY_9ROUTER_KEY`, `MONKEY_WORKER_MODEL`. Restart Claude Code after
+exporting — the MCP server only sees what it inherited at launch.
+
+Run the existing test suites (from the plugin repo root) with:
 
 ```bash
 python3 -m unittest discover -s server/tests
 uv run worker/tests/test_worker.py
+```
+
+The offline end-to-end driver (no live 9Router needed with `--fake`):
+
+```bash
+uv run server/tests/e2e_driver.py [--fake] [--api-base URL] [--model MODEL] [--phases N,N] [--repo PATH] [--keep]
 ```
 
 ## Phase 0 — environment (no code)
@@ -25,12 +35,14 @@ uv run worker/tests/test_worker.py
 - [ ] `python3 -m unittest discover -s server/tests` is green.
 - [ ] `uv run worker/tests/test_worker.py` is green.
 - [ ] 9Router dashboard: RTK / Caveman tool-result compression is OFF for the worker key.
+- [ ] Unset `MONKEY_WORKER_MODEL` (or any other required variable) and confirm `dispatch_task`
+      refuses with an error naming the variable, before any worktree is created — not a partial
+      run, not a fallback.
 
 ## Phase 1 — plumbing (after WP3/WP4)
 
-- [ ] T1.1: `configure(action="doctor")` is all green; `configure(action="discover_models",
-      profile=<default>)` lists the combo; `configure(action="probe", profile=<default>)`
-      returns `tool_calling: "confirmed"`.
+- [ ] T1.1: `configure(action="doctor")` is all green; `configure(action="discover_models")`
+      lists the combo; `configure(action="probe")` returns `tool_calling: "confirmed"`.
 - [ ] T1.2 (TDD split — the toy suite has no `subtract` test yet, so there is nothing to fail
       until task A writes it):
       - Task A: dispatch "add `test_subtract` to `tests/test_calc.py`, covering
@@ -48,7 +60,7 @@ uv run worker/tests/test_worker.py
 - [ ] T1.4 (compression check): dispatch a task that prints `fixtures/sentinel.txt` with `cat`
       and copies it verbatim into `fixtures/copy.txt`; inside the worktree,
       `cmp fixtures/sentinel.txt fixtures/copy.txt` reports no differences.
-- [ ] T1.5: dispatch with a temp profile pointing at a wrong model name → `probe` fails and
+- [ ] T1.5: with `MONKEY_WORKER_MODEL` pointing at a wrong model name → `probe` fails and
       `dispatch_task` refuses before any worktree is created.
 
 ## Phase 2 — gates and merge-back (after WP5)

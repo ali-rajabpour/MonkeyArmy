@@ -29,27 +29,23 @@ does this for you up front.
 (Developing locally: `claude --plugin-dir /path/to/monkey-army`.) Run `/mcp` — you should see the
 `monkeys` server with 13 tools.
 
-## 4. Configure by talking (no restart, no env vars)
-Run `/monkey-setup` (saying "monkeys: set up" also triggers it). The supervisor will:
-1. run `doctor` (checks uv, git, worker dependencies, 9Router reachability),
-2. ask for your 9Router URL,
-3. ask for the API key through a secure dialog (it never appears in the chat),
-4. list your combos and ask which one to use (and optional fallback),
-5. save it as the default profile and probe it (one tiny request, confirms tool-calling works).
+## 4. Configure via environment, then verify
+All configuration is environment variables — there is no config file and no in-chat setup dialog.
+Export the required ones (see `.env.example` for the full list and every optional one):
+```bash
+export MONKEY_9ROUTER_BASE_URL=http://100.64.0.1/v1
+export MONKEY_9ROUTER_KEY=<your key>
+export MONKEY_WORKER_MODEL=openai/combo/<id>
+```
+Put these in `~/.zshenv` (or your shell's profile) to keep them across sessions. The MCP server
+only sees what Claude Code inherited at launch, so **restart Claude Code** after exporting.
 
-Manual equivalent, if you prefer explicit commands in chat:
-- "configure: set profile `deepseek-combo`, model `openai/combo/<id>`, api_base
-  `http://100.64.0.1/v1`, key var `MONKEY_9ROUTER_KEY`, prices 0.27 / 1.10 per Mtok"
-- "configure: store key for `deepseek-combo`"  → dialog
-- "configure: probe `deepseek-combo`"
-
-Config lives in `~/.monkey-army/config.json`; the key in `~/.monkey-army/credentials.json` (0600).
-
-Environment fallbacks (optional, see `.env.example`): `MONKEY_9ROUTER_BASE_URL` supplies the
-endpoint for a profile that has no `api_base` of its own, and `MONKEY_9ROUTER_KEY` supplies the
-key when `credentials.json` has none. A profile's own `api_base` always wins. The MCP server
-inherits Claude Code's environment, so an `export` only reaches the workers if Claude Code was
-started from that shell afterwards.
+Then run `/monkey-setup` to verify. It calls `configure(action="status")` to confirm every
+variable is set and valid, `configure(action="doctor")` to check uv/git/worker deps/9Router
+reachability, `configure(action="discover_models")` to list combos if you need to pick
+`MONKEY_WORKER_MODEL`, and `configure(action="probe")` to confirm tool-calling works end to end.
+It never writes anything — if something is missing or invalid, it tells you the exact `export`
+line to add and to restart Claude Code.
 
 ## 5. Try it on a scratch repository
 ```bash
@@ -71,13 +67,15 @@ cp <plugin>/statusline/monkey-army-statusline.sh ~/.claude/ && chmod +x ~/.claud
 { "statusLine": { "type": "command", "command": "~/.claude/monkey-army-statusline.sh", "refreshInterval": 2 } }
 ```
 
-## Tuning (all via "configure: …", only when you ask)
-- Budget per task: `limits.max_budget_usd` (default $0.50) and `limits.max_tokens_total`.
-- Diff cap: `defaults.max_diff_lines` (300) — larger diffs fail on purpose; split the task.
-- Integration: `defaults.integrate_mode` = `commit` (squash commit per task) or `stage`.
-- Long tool waits: `wait_for_tasks` blocks up to 120 s by default; if your Claude Code MCP tool
-  timeout is lower, raise it via the `MCP_TOOL_TIMEOUT` environment variable — check your Claude
-  Code version's docs for the exact name and default, since these have changed across releases.
+## Tuning (environment variables, see `.env.example`; changes need a Claude Code restart)
+- Budget per task: `MONKEY_MAX_BUDGET_USD` (default $0.50) and `MONKEY_MAX_TOKENS_TOTAL`.
+- Diff cap: `MONKEY_MAX_DIFF_LINES` (300) — larger diffs fail on purpose; split the task.
+- Integration: `MONKEY_INTEGRATE_MODE` = `commit` (squash commit per task) or `stage`.
+- Long tool waits: `wait_for_tasks` blocks up to `MONKEY_WAIT_TIMEOUT_S` (default 120s, hard cap
+  170s). If your Claude Code MCP tool timeout is lower, raise it with the `MCP_TOOL_TIMEOUT`
+  environment variable (milliseconds) or the per-server `timeout` field in your MCP server
+  config — check your installed Claude Code version's docs for the current default and exact
+  name, since these have changed across releases.
 
 ## Removing the old skill
 If you previously used a personal `CTOwithMonkeyArmy` skill, delete it — its content is now the

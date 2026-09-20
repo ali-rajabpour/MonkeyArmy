@@ -1,71 +1,49 @@
 ---
 name: monkey-setup
-description: Guided one-time setup of the monkeys MCP server — 9Router URL, profile, API key (via secure dialog, never typed in chat), combo selection, probe. Triggered explicitly by "monkeys: set up", "set up monkey army", "configure the monkeys", or /monkey-setup. Do not use for a single config tweak the user names directly (use configure(...) yourself) or for running a delegation batch (use /monkey-army).
+description: Verify the monkeys MCP server's environment configuration and report what's missing — read-only checks (status, doctor, probe, discover_models), never mutates anything. Triggered explicitly by "monkeys: set up", "set up monkey army", "configure the monkeys", or /monkey-setup. Do not use for running a delegation batch (use /monkey-army).
 ---
 
-# Monkey Setup — guided first-run configuration
+# Monkey Setup — verification and guidance
 
-The user asked you to set the monkeys up. Every mutating `configure` call in this flow counts
-as user-requested because the user asked for setup by name — you do not need to re-confirm each
-one. Anything outside this flow (changing a profile later, switching the default, etc.) still
-needs an explicit request in that conversation; do not reuse this permission for it.
+Configuration is environment variables only — there is no config file, no profile, and nothing
+in this flow writes anything. Every step below is read-only. If a variable is missing or
+invalid, tell the user the exact `export` line to add and that Claude Code needs a restart to
+pick it up; do not try to work around it.
 
-Run the steps in order. Do not skip ahead or batch calls that depend on the user's answer.
+## 1. Check status
+`configure(action="status")` — reports every configuration variable: set/missing/invalid, and
+its resolved value or default. **Never echo the value of `MONKEY_9ROUTER_KEY`** — report only
+whether it is set.
 
-## 1. Check current state
-`configure(action="status")` — see what profiles/default already exist.
-`configure(action="doctor", repo_path=<repo, if known>)` — checks uv, git, worker deps, 9Router
-reachability. Fix anything it flags (report it, don't silently continue) before proceeding.
-
-## 2. 9Router URL
-Ask the user for their 9Router URL. Default if they have none ready: `http://localhost:20128/v1`.
-If `MONKEY_9ROUTER_BASE_URL` is set in the environment, offer that value as the default instead
-(`configure(action="status")` reports the resolved `api_base`).
-
-## 3. Profile name
-Ask what to call the profile. Default: `deepseek-combo`.
-
-## 4. Create the profile (placeholder model)
+If anything required is missing or invalid, stop here and print the exact lines the user should
+add, e.g.:
 ```
-configure(action="set_profile", name=<profile>, model="openai/combo/<placeholder>",
-          api_base=<url>, api_key_env_var="MONKEY_9ROUTER_KEY")
+export MONKEY_9ROUTER_BASE_URL=http://100.64.0.1/v1
+export MONKEY_9ROUTER_KEY=<your key>
+export MONKEY_WORKER_MODEL=openai/combo/<id>
 ```
-This is provisional — the model id is filled in for real at step 6.
+Tell them to put these in their shell profile (or `~/.zshenv`) and **restart Claude Code**, then
+re-run `/monkey-setup`. Do not proceed to the next step until status is clean.
 
-## 5. Store the key
-```
-configure(action="store_key", profile=<profile>)
-```
-Call it **without** a `key` argument — this opens a secure elicitation dialog; the key never
-enters the chat. If the user pastes a key into the conversation instead, do not store it as
-given: tell them to rotate that key (it transited the model conversation) and re-run
-`store_key` properly.
+## 2. Doctor
+`configure(action="doctor", repo_path=<repo, if known>)` — checks uv, git, worker dependencies,
+9Router reachability. Report anything it flags; don't silently continue.
 
-## 6. Discover combos
-```
-configure(action="discover_models", profile=<profile>)
-```
-Present the returned combos and ask the user which one to use. Optionally also ask for
-input/output prices per Mtok and a fallback model.
+## 3. Discover models
+`configure(action="discover_models")` — lists the model combos the configured key can see, so
+the user can confirm `MONKEY_WORKER_MODEL` is the right one or pick a better one. If they want to
+change it, tell them to export the new value and restart Claude Code — this skill cannot set it
+for them.
 
-## 7. Finalize the profile
-```
-configure(action="set_profile", name=<profile>, model="openai/combo/<chosen>", api_base=<url>,
-          api_key_env_var="MONKEY_9ROUTER_KEY", fallback_models=[...]?,
-          price_input_per_mtok=<?>, price_output_per_mtok=<?>)
-```
-
-## 8. Set as default
-`configure(action="set_default", name=<profile>)`
-
-## 9. Probe
-`configure(action="probe", profile=<profile>)`
+## 4. Probe
+`configure(action="probe")` — one tiny request against the configured model.
 
 Report the result: `ok`, `latency_ms`, `tool_calling`, `usage_present`. If `tool_calling` is
 `"not_observed"`, warn the user plainly — deepagents needs tool calling to work at all — and
-suggest they pick a different combo and repeat from step 6.
+suggest a different combo (repeat from step 3 after they change `MONKEY_WORKER_MODEL` and
+restart).
 
 Remind the user once: in 9Router, turn **off** RTK/Caveman tool-result compression for this key.
 Compressed tool results corrupt what the worker sees.
 
-Tell the user setup is done and they can run `/monkey-army` next.
+Tell the user setup is verified and they can run `/monkey-army` next.
