@@ -473,7 +473,7 @@ async def run_worker(
     # go through the same server-side pipeline, which decides the real
     # verdict. It runs real git/test subprocesses, so keep it off the event
     # loop.
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, verify.finalize_success, job, cfg)
 
 

@@ -144,16 +144,18 @@ def write_statusline(job: dict[str, Any]) -> None:
     THIS process (jobs.all_jobs() — an in-memory, per-process view; a
     restarted server starts this count over) an aggregate line replaces it,
     so concurrent delegations don't fight over the single status-line slot.
+
+    Now reachable from executor threads (offloaded tools) while the main
+    thread mutates the job registry concurrently, so the whole body is
+    best-effort: any failure here — including a race while iterating the
+    snapshot — is swallowed rather than surfaced.
     """
     try:
         from jobs import all_jobs
         snapshot = all_jobs()
-    except Exception:  # noqa: BLE001 - status line must never break the caller
-        snapshot = []
-    active = sum(1 for j in snapshot if j.get("status") in _ACTIVE_STATUSES)
-    rendered = _aggregate(snapshot, time.time()) if active > 1 else render(job)
-    path = global_path()
-    try:
+        active = sum(1 for j in snapshot if j.get("status") in _ACTIVE_STATUSES)
+        rendered = _aggregate(snapshot, time.time()) if active > 1 else render(job)
+        path = global_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         if rendered is None:
             path.unlink(missing_ok=True)
@@ -162,5 +164,5 @@ def write_statusline(job: dict[str, Any]) -> None:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(f"{until}\n{line}\n", encoding="utf-8")
         tmp.replace(path)  # atomic: the reader never sees a half-written file
-    except OSError:
-        pass
+    except Exception:  # noqa: BLE001 - status line must never break the caller
+        return

@@ -15,6 +15,7 @@ dependency install.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import sys
 import time
@@ -50,6 +51,18 @@ from worker_launcher import comm_dir_for, run_worker
 
 cfg = load_defaults()
 mcp = FastMCP("monkey-army")
+
+
+async def _offload(fn, *args, **kwargs):
+    """Run a blocking call (subprocess, HTTP, git) off the event loop.
+
+    Several tools shell out or make HTTP calls that can take tens of
+    seconds; running them inline stalls the loop, which starves worker
+    stdout consumption (looks like a false "stall") and blocks
+    wait_for_tasks/other tools from ticking.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
 
 @mcp.tool(
@@ -90,7 +103,7 @@ async def dispatch_task(
     # Probe BEFORE creating anything (§6.1 step 2): a dead endpoint or wrong
     # model name must never leave a worktree/branch behind for the supervisor
     # to clean up.
-    probe_result = backend.probe(resolved, ttl_s=cfg.probe_ttl_s)
+    probe_result = await _offload(backend.probe, resolved, ttl_s=cfg.probe_ttl_s)
     if not probe_result.get("ok"):
         return json.dumps({
             "error": f"profile {resolved['name']!r} failed its health probe: "
@@ -102,7 +115,7 @@ async def dispatch_task(
     if not allowed_files:
         warnings.append("allowed_files is empty/unrestricted — scope enforcement will not apply to this task")
 
-    wt = create_worktree(repo_path, base_branch)
+    wt = await _offload(create_worktree, repo_path, base_branch)
     job: dict[str, Any] = {
         **wt,
         "title": title, "spec": spec,
@@ -138,8 +151,8 @@ async def dispatch_task(
     if test_command:
         # Capped well below the MCP client's own tool timeout: a slow-but-legit
         # test command shows up as advisory timed_out, never a failed dispatch.
-        preflight_report = await asyncio.get_event_loop().run_in_executor(
-            None, verify_mod.run_command, test_command, wt["worktree"], cfg.preflight_timeout_s
+        preflight_report = await _offload(
+            verify_mod.run_command, test_command, wt["worktree"], cfg.preflight_timeout_s
         )
         events.publish(
             wt["repo"], wt["taskId"],
@@ -338,7 +351,7 @@ async def cancel_task(task_id: str) -> str:
 
         j["status"] = "cancelled"
         j["error"] = "cancelled by supervisor (stale job from a previous server session)"
-        if salvage_worktree(j):
+        if await _offload(salvage_worktree, j):
             j["salvaged"] = True
         persist_job(j)
         events.publish(
@@ -548,7 +561,7 @@ async def integrate_task(
         return json.dumps({"error": "unknown task_id"})
     integrate_mode = mode or cfg.integrate_mode
     try:
-        result = git_ops.integrate(j, j["repo"], message, integrate_mode, allow_branch_mismatch)
+        result = await _offload(git_ops.integrate, j, j["repo"], message, integrate_mode, allow_branch_mismatch)
     except Exception as e:  # noqa: BLE001 - never leak a raw traceback to the supervisor
         return json.dumps({
             "task_id": task_id, "integrated": False, "reason": "error",
@@ -599,7 +612,7 @@ async def batch(
         if not repo_path or not batch_id:
             return json.dumps({"error": "finish requires repo_path and batch_id"})
         try:
-            return json.dumps(batches.finish(repo_path, batch_id, verify_command, mode, cfg))
+            return json.dumps(await _offload(batches.finish, repo_path, batch_id, verify_command, mode, cfg))
         except KeyError as e:
             return json.dumps({"error": str(e)})
 
@@ -773,17 +786,17 @@ async def configure(
             resolved = store.resolve_profile(profile)
         except KeyError as e:
             return json.dumps({"error": str(e)})
-        return json.dumps(backend.discover_models(resolved))
+        return json.dumps(await _offload(backend.discover_models, resolved))
 
     if action == "probe":
         try:
             resolved = store.resolve_profile(profile)
         except KeyError as e:
             return json.dumps({"error": str(e)})
-        return json.dumps(backend.probe(resolved, ttl_s=cfg.probe_ttl_s))
+        return json.dumps(await _offload(backend.probe, resolved, ttl_s=cfg.probe_ttl_s))
 
     if action == "doctor":
-        return json.dumps({"checks": backend.doctor(repo_path)})
+        return json.dumps({"checks": await _offload(backend.doctor, repo_path)})
 
     if action == "add_note":
         if not repo_path or not text:
@@ -796,7 +809,7 @@ async def configure(
 
     if action == "prune":
         repos = [str(Path(repo_path).resolve())] if repo_path else store.all_repos()
-        results = [store.prune_repo(r, older_than_days or 14) for r in repos]
+        results = [await _offload(store.prune_repo, r, older_than_days or 14) for r in repos]
         return json.dumps({"pruned": results})
 
     return json.dumps({"error": f"unknown action {action!r}"})

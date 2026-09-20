@@ -53,8 +53,18 @@ def get_job(task_id: str) -> dict[str, Any] | None:
 
 
 def all_jobs() -> list[dict[str, Any]]:
-    """Snapshot of every job live in this server process (liveness checks)."""
-    return list(_jobs.values())
+    """Snapshot of every job live in this server process (liveness checks).
+
+    Offloaded tools now call this from executor threads while the main
+    thread's event loop mutates `_jobs` concurrently; `dict.values()` can
+    raise "dictionary changed size during iteration" if a job is put/deleted
+    mid-snapshot. One retry clears that without needing a lock for a
+    read-mostly, best-effort snapshot.
+    """
+    try:
+        return list(_jobs.values())
+    except RuntimeError:
+        return list(_jobs.values())
 
 
 def put_job(job: dict[str, Any]) -> None:

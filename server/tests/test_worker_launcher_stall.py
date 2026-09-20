@@ -110,11 +110,11 @@ class TestStallWatchdog(_MockSubprocessCase):
         cfg = _make_cfg(stall_timeout_s=1)  # tiny, for a fast test
 
         with self._patched_exec(script, cwd=job["worktree"]):
-            start = asyncio.get_event_loop().time()
+            start = asyncio.get_running_loop().time()
             # Hard cap far above the stall timeout: if this fires instead, the
             # stall watchdog isn't doing its job.
             await run_worker(cfg, job, self._run_args(), timeout_ms=60_000)
-            elapsed = asyncio.get_event_loop().time() - start
+            elapsed = asyncio.get_running_loop().time() - start
 
         self.assertEqual(job["status"], "timeout")
         self.assertIn("stalled", job["error"])
