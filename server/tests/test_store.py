@@ -5,6 +5,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -243,6 +244,45 @@ class TestNotes(StoreTestCase):
             store.notes_path(repo).write_text("x" * 3990, encoding="utf-8")
             with self.assertRaises(ValueError):
                 store.append_note(repo, "this pushes it over the cap")
+
+
+class TestResetConfig(unittest.TestCase):
+    """A wrong answer in the setup wizard must be recoverable without the user
+    hand-deleting files (§ wizard reset)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"MONKEY_ARMY_HOME": self.tmp.name})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_reset_removes_config_and_credentials(self):
+        store.set_profile("p", "openai/combo/x", api_key_env_var="K")
+        store.store_credential("K", "sk-secret")
+        self.assertTrue(store.config_path().exists())
+        self.assertTrue(store.credentials_path().exists())
+
+        removed = store.reset_config()
+        self.assertEqual(removed, {"config_removed": True, "credentials_removed": True})
+        self.assertFalse(store.config_path().exists())
+        self.assertFalse(store.credentials_path().exists())
+        self.assertEqual(store.load_store()["profiles"], {})
+
+    def test_reset_is_idempotent(self):
+        self.assertEqual(
+            store.reset_config(), {"config_removed": False, "credentials_removed": False}
+        )
+
+    def test_reset_keeps_repo_state(self):
+        repo_state = store.home_dir() / "repos"
+        repo_state.mkdir(parents=True, exist_ok=True)
+        (repo_state / "keep.txt").write_text("work in flight", encoding="utf-8")
+        store.set_profile("p", "openai/combo/x")
+        store.reset_config()
+        self.assertTrue((repo_state / "keep.txt").exists())
 
 
 if __name__ == "__main__":

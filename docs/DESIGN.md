@@ -299,6 +299,13 @@ with deepagents 0.7.0a6.
   the tools disappear exactly when you are developing the plugin. Inline declaration removes the
   duplicate entirely. `claude plugin validate .` passes.
 
+2026-09-20 (setup repair):
+- `configure(action="reset")` deletes `config.json` and `credentials.json` in two steps (the
+  first call reports what it would delete; only `text="confirm"` performs it). It deliberately
+  keeps per-repo state — jobs, patches, notes, worktrees — because resetting provider
+  configuration is not the same as discarding work in flight. Editing one field stays a plain
+  `set_profile` with the same name, so reset is never the first tool reached for.
+
 ## VERIFY table (plan §14)
 
 | Claim | Outcome | Evidence / fallback taken |

@@ -755,7 +755,7 @@ async def _configure_store_key(profile: str, key: str | None) -> str:
         "Only call mutating actions when the user explicitly asked for a configuration change. "
         "Manages worker profiles, defaults, API keys, and diagnostics: status, set_profile, "
         "remove_profile, set_default, set_defaults, store_key, discover_models, probe, doctor, "
-        "add_note, prune. action selects the operation; other args vary per action."
+        "add_note, prune, reset. action selects the operation; other args vary per action."
     )
 )
 async def configure(
@@ -877,6 +877,24 @@ async def configure(
         repos = [str(Path(repo_path).resolve())] if repo_path else store.all_repos()
         results = [await _offload(store.prune_repo, r, older_than_days or 14) for r in repos]
         return json.dumps({"pruned": results})
+
+    if action == "reset":
+        # Deliberately two-step: a wrong profile is fixed by re-running
+        # set_profile, so a full wipe is only ever what someone asked for
+        # explicitly. `text="confirm"` is that second step.
+        if text != "confirm":
+            cfg_store = store.load_store()
+            return json.dumps({
+                "error": "reset deletes every profile and stored key; call again with text='confirm'",
+                "would_delete": {
+                    "profiles": sorted(cfg_store["profiles"]),
+                    "config_path": str(store.config_path()),
+                    "credentials_path": str(store.credentials_path()),
+                },
+                "note": "to change one profile, use set_profile (same name overwrites) or remove_profile",
+            })
+        removed = store.reset_config()
+        return json.dumps({"reset": True, **removed})
 
     return json.dumps({"error": f"unknown action {action!r}"})
 

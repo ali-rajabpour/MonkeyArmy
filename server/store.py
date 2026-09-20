@@ -207,6 +207,24 @@ def set_default_profile(name: str) -> None:
     save_store(store)
 
 
+def reset_config() -> dict[str, bool]:
+    """Delete config.json and credentials.json — every profile, the default,
+    the defaults block and every stored key.
+
+    Repo state (jobs, patches, notes, worktrees) is deliberately untouched:
+    resetting the provider configuration is not the same as discarding work
+    in flight. Returns which files actually existed.
+    """
+    removed = {}
+    for label, path in (("config", config_path()), ("credentials", credentials_path())):
+        try:
+            path.unlink()
+            removed[f"{label}_removed"] = True
+        except FileNotFoundError:
+            removed[f"{label}_removed"] = False
+    return removed
+
+
 def store_credential(env_var_name: str, key: str) -> None:
     creds = _read_json(credentials_path())
     creds[env_var_name] = key

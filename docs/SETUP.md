@@ -86,6 +86,23 @@ cp <plugin>/statusline/monkey-army-statusline.sh ~/.claude/ && chmod +x ~/.claud
   timeout is lower, raise it via the `MCP_TOOL_TIMEOUT` environment variable — check your Claude
   Code version's docs for the exact name and default, since these have changed across releases.
 
+## Changing or resetting the configuration
+
+Run `/monkey-setup` again and say what is wrong — it maps your request to the smallest change:
+
+- a wrong URL, model, price or fallback → the profile is overwritten in place, key untouched;
+- a wrong key → the dialog opens again and replaces it;
+- an unwanted profile → removed, and the default moves if needed;
+- start over → `configure(action="reset")` reports what it would delete, and only a second call
+  with `text="confirm"` deletes every profile and stored key. Jobs, patches, notes and worktrees
+  under `~/.monkey-army/repos/` are deliberately kept.
+
+## Personas and custom agents
+
+If you launch Claude Code through an agent definition with an explicit `tools:` list
+(`~/.claude/agents/<name>.md`), add `mcp__plugin_monkey-army_monkeys` to that list. Without it
+the server connects and `claude mcp list` looks healthy, but its tools never reach the session.
+
 ## Removing the old skill
 If you previously used a personal `CTOwithMonkeyArmy` skill, delete it — its content is now the
 plugin's `monkey-army` skill.

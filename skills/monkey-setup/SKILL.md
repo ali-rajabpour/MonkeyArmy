@@ -1,6 +1,6 @@
 ---
 name: monkey-setup
-description: Guided one-time setup of the monkeys MCP server — 9Router URL, profile, API key (via secure dialog, never typed in chat), combo selection, probe. Triggered explicitly by "monkeys: set up", "set up monkey army", "configure the monkeys", or /monkey-setup. Do not use for a single config tweak the user names directly (use configure(...) yourself) or for running a delegation batch (use /monkey-army).
+description: Guided setup and repair of the monkeys MCP server — 9Router URL, profile, API key (secure dialog, or typed in chat if the dialog is unavailable), combo selection, probe. Also fixes a configuration afterwards: edit or remove a profile, change the default, re-enter the key, or reset everything and start over. Triggered by "monkeys: set up", "set up monkey army", "configure the monkeys", "reset the monkey setup", "remove the monkey profile", or /monkey-setup. Not for running a delegation batch (use /monkey-army).
 ---
 
 # Monkey Setup — guided first-run configuration
@@ -79,3 +79,24 @@ Remind the user once: in 9Router, turn **off** RTK/Caveman tool-result compressi
 Compressed tool results corrupt what the worker sees.
 
 Tell the user setup is done and they can run `/monkey-army` next.
+
+## Fixing a mistake / starting over
+
+The user may ask to correct something after setup. Match the request to the smallest action:
+
+- **Wrong URL, model, prices or fallback** → `configure(action="set_profile", name=<same name>, ...)`
+  with the corrected values. Same name overwrites; the stored key is untouched. Re-probe after.
+- **Wrong key** → `configure(action="store_key", profile=<profile>)` again (dialog first, as in
+  step 5). The new key replaces the old one.
+- **Unwanted profile** → `configure(action="remove_profile", name=<profile>)`. If it was the
+  default, another profile becomes default automatically — confirm with `status` and set the one
+  the user wants with `set_default`.
+- **Wrong default** → `configure(action="set_default", name=<profile>)`.
+- **Start completely from scratch** → `configure(action="reset")` returns what it would delete
+  and asks for confirmation; repeat with `configure(action="reset", text="confirm")` to delete
+  every profile and stored key. Repo state (jobs, patches, notes, worktrees) is kept. Then run
+  this wizard from step 1.
+
+Always show `configure(action="status")` after a change so the user sees the result. Never reset
+when a smaller action fixes it — ask which they want if the request is ambiguous ("it's wrong"
+usually means one field, not everything).

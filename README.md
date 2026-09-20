@@ -43,6 +43,14 @@ Installed plugins load in every conversation, so you can reach for the monkeys a
 
 Full walkthrough: [`docs/SETUP.md`](docs/SETUP.md).
 
+Got something wrong? `/monkey-setup` also fixes it: re-run it to overwrite a profile, or ask to
+remove a profile, change the default, re-enter the key, or reset the configuration completely
+(`configure(action="reset")`, two-step, keeps your task history).
+
+If you launch Claude Code through a custom agent/persona with an explicit `tools:` list, add
+`mcp__plugin_monkey-army_monkeys` to it — otherwise the server connects but its tools never
+reach the session.
+
 ## What a run looks like (illustrative)
 
 ```
