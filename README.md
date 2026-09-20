@@ -22,7 +22,7 @@ and reviewed and merged back by the supervisor — never idle tokens spent on ty
 3. `/plugin marketplace add ali-rajabpour/MonkeyArmy` then
    `/plugin install monkey-army@monkey-army`.
 4. Say **"monkeys: set up"** — no restart, no env vars, key never appears in chat.
-5. Try it on a scratch repo: `/monkey-army add a subtract(a, b) function...`.
+5. Try it on a scratch repo: `/monkey-army add a subtract(a, b) function to calc/__init__.py...`.
 
 Full walkthrough: [`docs/SETUP.md`](docs/SETUP.md).
 

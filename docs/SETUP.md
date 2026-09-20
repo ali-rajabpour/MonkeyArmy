@@ -30,7 +30,7 @@ does this for you up front.
 `monkeys` server with 13 tools.
 
 ## 4. Configure by talking (no restart, no env vars)
-Say: **"monkeys: set up"**. The supervisor will:
+Run `/monkey-setup` (saying "monkeys: set up" also triggers it). The supervisor will:
 1. run `doctor` (checks uv, git, worker dependencies, 9Router reachability),
 2. ask for your 9Router URL,
 3. ask for the API key through a secure dialog (it never appears in the chat),
@@ -53,7 +53,7 @@ claude
 `<plugin>` is wherever Claude Code installed this plugin (check with `/plugin`, or use the path
 you passed to `--plugin-dir` if developing locally).
 
-Then: `/monkey-army add a subtract(a, b) function to calc.py with tests; pytest must pass`.
+Then: `/monkey-army add a subtract(a, b) function to calc/__init__.py with tests; pytest must pass`.
 Watch the plan, the review, and the single squash commit that lands on `main`.
 
 ## Optional: status line

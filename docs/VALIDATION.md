@@ -12,7 +12,8 @@ cp -r examples/toy-repo /tmp/toy && cd /tmp/toy && git init -b main && git add .
 Run the existing test suite (from the plugin repo root) with:
 
 ```bash
-uv run --no-project --with pytest python -m pytest -q
+python3 -m unittest discover -s server/tests
+uv run worker/tests/test_worker.py
 ```
 
 ## Phase 0 — environment (no code)
@@ -21,7 +22,8 @@ uv run --no-project --with pytest python -m pytest -q
 - [ ] One `chat/completions` call with a `tools` array to `combo/<id>` returns `tool_calls` and
       `usage`; note the `model` field in the response.
 - [ ] `uv --version` and `git --version` both succeed.
-- [ ] `uv run --no-project --with pytest python -m pytest -q` is green on the existing suite.
+- [ ] `python3 -m unittest discover -s server/tests` is green.
+- [ ] `uv run worker/tests/test_worker.py` is green.
 - [ ] 9Router dashboard: RTK / Caveman tool-result compression is OFF for the worker key.
 
 ## Phase 1 — plumbing (after WP3/WP4)
@@ -29,9 +31,18 @@ uv run --no-project --with pytest python -m pytest -q
 - [ ] T1.1: `configure(action="doctor")` is all green; `configure(action="discover_models",
       profile=<default>)` lists the combo; `configure(action="probe", profile=<default>)`
       returns `tool_calling: "confirmed"`.
-- [ ] T1.2: dispatch "add `subtract(a,b)` to `calc/__init__.py`; tests in `tests/test_calc.py`
-      already fail" against `/tmp/toy` → job ends `succeeded`, `verification.passed` true,
-      `priced:true`, `models_seen` non-empty.
+- [ ] T1.2 (TDD split — the toy suite has no `subtract` test yet, so there is nothing to fail
+      until task A writes it):
+      - Task A: dispatch "add `test_subtract` to `tests/test_calc.py`, covering
+        `subtract(a, b)` for positive, negative and zero cases; do not implement `subtract`
+        itself" against `/tmp/toy`, `allowed_files=["tests/test_calc.py"]`. Job ends
+        `succeeded`. Review the new test — it should fail for the right reason (`subtract` does
+        not exist yet) — then approve and integrate.
+      - Task B: dispatch "implement `subtract(a, b)` in `calc/__init__.py` so
+        `tests/test_calc.py::test_subtract` passes" against `/tmp/toy`,
+        `allowed_files=["calc/__init__.py"]`, `test_command="uv run --no-project --with pytest
+        python -m pytest -q"`. Job ends `succeeded`, `verification.passed` true, `priced:true`,
+        `models_seen` non-empty.
 - [ ] T1.3: during the run, `git status` inside `/tmp/toy` stays clean, and the worktree appears
       under `~/.monkey-army/repos/<slug>/worktrees/<task_id>/`, not inside `/tmp/toy`.
 - [ ] T1.4 (compression check): dispatch a task that prints `fixtures/sentinel.txt` with `cat`
