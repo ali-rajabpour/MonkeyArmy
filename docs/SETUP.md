@@ -33,14 +33,18 @@ does this for you up front.
 Run `/monkey-setup` (saying "monkeys: set up" also triggers it). The supervisor will:
 1. run `doctor` (checks uv, git, worker dependencies, 9Router reachability),
 2. ask for your 9Router URL,
-3. ask for the API key through a secure dialog (it never appears in the chat),
+3. ask for the API key through a secure dialog (it never appears in the chat); if your
+   client has no dialog, you can type the key in the chat instead and the supervisor stores
+   it for you — it will tell you to rotate that key afterwards, since it passed through the
+   conversation and the session transcript,
 4. list your combos and ask which one to use (and optional fallback),
 5. save it as the default profile and probe it (one tiny request, confirms tool-calling works).
 
 Manual equivalent, if you prefer explicit commands in chat:
 - "configure: set profile `deepseek-combo`, model `openai/combo/<id>`, api_base
   `http://100.64.0.1/v1`, key var `MONKEY_9ROUTER_KEY`, prices 0.27 / 1.10 per Mtok"
-- "configure: store key for `deepseek-combo`"  → dialog
+- "configure: store key for `deepseek-combo`"  → dialog (or paste the key in chat and it is
+  stored directly, with a rotate-it reminder)
 - "configure: probe `deepseek-combo`"
 
 Config lives in `~/.monkey-army/config.json`; the key in `~/.monkey-army/credentials.json` (0600).

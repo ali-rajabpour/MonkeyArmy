@@ -34,10 +34,22 @@ This is provisional — the model id is filled in for real at step 6.
 ```
 configure(action="store_key", profile=<profile>)
 ```
-Call it **without** a `key` argument — this opens a secure elicitation dialog; the key never
-enters the chat. If the user pastes a key into the conversation instead, do not store it as
-given: tell them to rotate that key (it transited the model conversation) and re-run
-`store_key` properly.
+Call it **without** a `key` argument first — that opens a secure dialog and the key never enters
+the chat. This is the path to prefer, always.
+
+If the dialog is unavailable (the client does not support elicitation, and the tool says so) or
+the user asks to enter the key directly, take it in the conversation and store it:
+```
+configure(action="store_key", profile=<profile>, key="<key the user gave>")
+```
+Then say plainly, once: the key passed through the model conversation and is written to this
+session's transcript on disk, so rotate it in the 9Router dashboard when convenient and re-enter
+the new one through the dialog. Do not repeat the key back, do not echo it in a summary, and do
+not put it in a note. Never ask the user to paste a key when the dialog is available — offer the
+dialog first and let them choose.
+
+The key is saved to `~/.monkey-army/credentials.json` (mode 0600) either way. The user never
+edits a file and never sets an environment variable.
 
 ## 6. Discover combos
 ```
