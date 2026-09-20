@@ -200,6 +200,35 @@ def changed_files(worktree: str) -> list[str]:
     return files
 
 
+def committed_files(worktree: str, base_sha: str) -> list[str]:
+    """Files committed since ``base_sha`` on HEAD — as opposed to
+    ``changed_files``, which only sees uncommitted porcelain and misses
+    anything the worker already committed. Never raises: [] if the worktree
+    is gone or git errors.
+    """
+    try:
+        out = _git(worktree, "diff", "--name-only", "--no-renames", base_sha, "HEAD").stdout
+    except (subprocess.CalledProcessError, OSError):
+        return []
+    return [line for line in out.splitlines() if line]
+
+
+def branch_descends_from_base(worktree: str, base_sha: str) -> bool:
+    """True iff ``base_sha`` is an ancestor of the worktree's current HEAD —
+    i.e. history wasn't rewritten out from under it (a stray reset moving
+    HEAD to an unrelated or earlier commit). Fails closed: any git error
+    (missing base_sha, detached weirdness) counts as "can't prove ancestry".
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base_sha, "HEAD"], cwd=worktree,
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0
+
+
 def stage_files(worktree: str, files: list[str]) -> None:
     """Stage exactly `files`, one `git add -A -- <path>` per path — never a
     bare `git add -A`, which would sweep up changes a caller deliberately

@@ -544,10 +544,14 @@ async def review_task(task_id: str, verdict: str, feedback: str | None = None) -
         return json.dumps({"error": str(e)})
     args = worker_launcher.build_worker_args(j, resolved)
     run_timeout_ms = int((j.get("timeoutS") or resolved["limits"]["timeout_s"]) * 1000)
+    # A stale runtime entry (cancelled=True, an old proc handle) from the
+    # attempt just rejected would otherwise survive into the retry and make
+    # it finalize as cancelled the moment it produces output.
+    runtime[j["taskId"]] = {}
     task = asyncio.create_task(
         worker_launcher.retry(cfg, j, args, j["feedbackHistory"], run_timeout_ms)
     )
-    runtime.setdefault(j["taskId"], {})["task"] = task
+    runtime[j["taskId"]]["task"] = task
 
     return json.dumps({"task_id": task_id, "attempt": j["attempt"], "status": "running"})
 

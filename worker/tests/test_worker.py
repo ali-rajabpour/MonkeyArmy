@@ -82,15 +82,11 @@ class TestGitCommandAllowed(unittest.TestCase):
             "git rm file.py",
             "git mv a.py b.py",
             "git restore file.py",
-            "git commit -m 'msg'",
             "git merge-base A B",
             "git branch",
             "git branch --show-current",
             "git branch --list",
             "git branch -a",
-            "git reset",
-            "git reset --soft HEAD~1",
-            "git reset file.py",
             "echo hi",
             "ls -la",
         ]:
@@ -111,17 +107,43 @@ class TestGitCommandAllowed(unittest.TestCase):
             "git worktree add ../x",
             "git branch -D main",
             "git branch new-branch",
+            # The server commits, not the worker — commit stopped being a
+            # scope-checkable no-op once a committed file could dodge the
+            # uncommitted-porcelain scope check (review-fix §C.1).
+            "git commit -m 'msg'",
+            "git reset",
+            "git reset --soft HEAD~1",
+            "git reset file.py",
             "git reset --hard",
             "git reset --merge",
             "git reset --keep",
         ]:
             self.assertFalse(self._allowed(cmd), cmd)
 
-    def test_global_options_are_skipped(self):
+    def test_blocked_global_options(self):
+        # -c/-C outrank GIT_CONFIG_* and let a worker point git at another
+        # repo entirely — blocked outright, even in front of an otherwise
+        # allowed subcommand.
+        self.assertFalse(self._allowed("git -c protocol.allow=always push"))
+        self.assertFalse(self._allowed("git -c a=b status"))
+        self.assertFalse(self._allowed("git -C /tmp status"))
         self.assertFalse(self._allowed("git -C . push"))
-        self.assertFalse(self._allowed("git -c a=b push"))
-        self.assertTrue(self._allowed("git -C . status"))
+        # Both the inline and two-token forms.
+        self.assertFalse(self._allowed("git --git-dir=/x status"))
+        self.assertFalse(self._allowed("git --git-dir /x status"))
+        self.assertFalse(self._allowed("git --work-tree=/x status"))
+        self.assertFalse(self._allowed("git --work-tree /x status"))
+        self.assertFalse(self._allowed("git --exec-path=/x status"))
+        self.assertFalse(self._allowed("git --namespace=x status"))
+        # The read-only pager options stay allowed.
         self.assertTrue(self._allowed("git --no-pager log"))
+        self.assertTrue(self._allowed("git -p log"))
+        self.assertTrue(self._allowed("git --paginate log"))
+
+    def test_blocked_global_option_reason_text(self):
+        ok, reason = worker.git_command_allowed("git -c protocol.allow=always push")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "git global option -c is blocked for workers")
 
     def test_sh_and_bash_recursion(self):
         self.assertFalse(self._allowed('sh -c "git push"'))

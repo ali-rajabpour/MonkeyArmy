@@ -11,9 +11,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from jobs import (
+    branch_descends_from_base,
     changed_files,
     cleanup_job,
     commit_worktree,
+    committed_files,
     create_worktree,
     diff_and_stat,
     salvage_worktree,
@@ -153,6 +155,45 @@ class TestDiffAndStat(JobsTestCase):
         wt = create_worktree(self.repo, "main")
         d = diff_and_stat(wt["worktree"], wt["baseSha"])
         self.assertEqual(d, {"patch": "", "files": [], "added": 0, "removed": 0, "lines": 0})
+
+
+class TestCommittedFiles(JobsTestCase):
+    def test_sees_a_committed_file_but_not_an_uncommitted_one(self):
+        wt = create_worktree(self.repo, "main")
+        worktree = wt["worktree"]
+        (Path(worktree) / "committed.txt").write_text("x", encoding="utf-8")
+        stage_files(worktree, ["committed.txt"])
+        commit_worktree(worktree, "wip")
+        (Path(worktree) / "uncommitted.txt").write_text("y", encoding="utf-8")
+
+        self.assertEqual(committed_files(worktree, wt["baseSha"]), ["committed.txt"])
+
+    def test_no_commits_since_base_is_empty(self):
+        wt = create_worktree(self.repo, "main")
+        self.assertEqual(committed_files(wt["worktree"], wt["baseSha"]), [])
+
+
+class TestBranchDescendsFromBase(JobsTestCase):
+    def test_true_on_a_fresh_worktree(self):
+        wt = create_worktree(self.repo, "main")
+        self.assertTrue(branch_descends_from_base(wt["worktree"], wt["baseSha"]))
+
+    def test_true_after_a_normal_commit(self):
+        wt = create_worktree(self.repo, "main")
+        worktree = wt["worktree"]
+        (Path(worktree) / "f.txt").write_text("x", encoding="utf-8")
+        stage_files(worktree, ["f.txt"])
+        commit_worktree(worktree, "wip")
+        self.assertTrue(branch_descends_from_base(worktree, wt["baseSha"]))
+
+    def test_false_when_head_is_reset_before_base(self):
+        # Give main a second commit so baseSha has a parent to reset back to.
+        _git(self.repo, "-c", "user.name=t", "-c", "user.email=t@t",
+             "commit", "--allow-empty", "-m", "second")
+        wt = create_worktree(self.repo, "main")
+        worktree = wt["worktree"]
+        _git(worktree, "reset", "--hard", f"{wt['baseSha']}~1")
+        self.assertFalse(branch_descends_from_base(worktree, wt["baseSha"]))
 
 
 class TestCommitWorktree(JobsTestCase):

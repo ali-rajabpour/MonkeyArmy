@@ -70,16 +70,19 @@ _DRIVE_SCAN_RE = re.compile(r"""\bfind\s+['"]?(?:/|[A-Za-z]:[/\\]?)['"]?(?:\s|$)
 # history. Default is deny: only an explicit allowlist of inspection/local
 # git subcommands passes; everything else, known or not, is blocked.
 _GIT_SEPARATORS = {"&&", "||", ";", "|"}
-_GIT_GLOBAL_OPTS_WITH_ARG = {"-C", "-c"}
 _GIT_GLOBAL_OPTS_NO_ARG = {"--no-pager", "-p", "--paginate"}
-_GIT_GLOBAL_OPTS_INLINE = ("--git-dir=", "--work-tree=", "--exec-path=", "--namespace=")
+# `-c`/`-C` outrank GIT_CONFIG_*, and --git-dir/--work-tree/--exec-path/
+# --namespace let a worker point git at an entirely different repo — none of
+# that is stoppable from the environment layer, so these are blocked
+# outright rather than skipped-over like the read-only options above.
+_GIT_GLOBAL_OPTS_BLOCKED_WITH_ARG = {"-c", "-C"}
+_GIT_GLOBAL_OPTS_BLOCKED_PREFIXED = ("--git-dir", "--work-tree", "--exec-path", "--namespace")
 
 _GIT_ALLOWED_SUBCOMMANDS = {
     "status", "diff", "log", "show", "add", "blame", "grep", "ls-files",
-    "rev-parse", "apply", "rm", "mv", "restore", "commit", "merge-base",
+    "rev-parse", "apply", "rm", "mv", "restore", "merge-base",
 }
 _GIT_BRANCH_SAFE_ARGS = {"--show-current", "--list", "-a"}
-_GIT_RESET_DANGEROUS_ARGS = {"--hard", "--merge", "--keep"}
 
 _GIT_BLOCKED_MSG = (
     "git {sub} is blocked for workers: you operate on a disposable branch; the supervisor "
@@ -121,14 +124,33 @@ def _split_on_separators(tokens: list[str]) -> list[list[str]]:
     return commands
 
 
-def _git_subcommand_index(tokens: list[str]) -> int | None:
-    """Index of the first token after ``git`` that isn't a global option."""
+def _git_blocked_global_option(tokens: list[str]) -> str | None:
+    """First blocked global option token found before the subcommand, or
+    None. Covers both the inline (``--git-dir=x``) and two-token
+    (``--git-dir x``) forms git itself accepts for the prefixed options."""
     i = 1
     while i < len(tokens):
         tok = tokens[i]
-        if tok in _GIT_GLOBAL_OPTS_WITH_ARG:
-            i += 2
-        elif tok in _GIT_GLOBAL_OPTS_NO_ARG or tok.startswith(_GIT_GLOBAL_OPTS_INLINE):
+        if tok in _GIT_GLOBAL_OPTS_BLOCKED_WITH_ARG:
+            return tok
+        if tok.startswith(_GIT_GLOBAL_OPTS_BLOCKED_PREFIXED):
+            return tok.split("=", 1)[0]
+        if tok in _GIT_GLOBAL_OPTS_NO_ARG:
+            i += 1
+            continue
+        return None
+    return None
+
+
+def _git_subcommand_index(tokens: list[str]) -> int | None:
+    """Index of the first token after ``git`` that isn't an allowed
+    (read-only) global option. Caller checks ``_git_blocked_global_option``
+    first — anything else that looks like a flag here just becomes the
+    "subcommand" candidate and fails the allowlist (default deny)."""
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _GIT_GLOBAL_OPTS_NO_ARG:
             i += 1
         else:
             return i
@@ -139,10 +161,6 @@ def _git_subcommand_allowed(sub: str, rest: list[str]) -> bool:
     if sub == "branch":
         # No args (plain listing) or only read-only flags — never a rename/delete.
         return all(tok in _GIT_BRANCH_SAFE_ARGS for tok in rest)
-    if sub == "reset":
-        # Soft/mixed resets touch only the index and HEAD; --hard/--merge/--keep
-        # can discard working-tree changes, which is not this tool's call to make.
-        return not any(tok in _GIT_RESET_DANGEROUS_ARGS for tok in rest)
     return sub in _GIT_ALLOWED_SUBCOMMANDS
 
 
@@ -179,6 +197,10 @@ def git_command_allowed(command: str) -> tuple[bool, str]:
         if git_at is None:
             continue
         simple = simple[git_at:]
+
+        blocked_opt = _git_blocked_global_option(simple)
+        if blocked_opt is not None:
+            return False, f"git global option {blocked_opt} is blocked for workers"
 
         idx = _git_subcommand_index(simple)
         if idx is None:
@@ -679,8 +701,9 @@ MICRO_SYSTEM_PROMPT = (
     "Use relative paths. Run the acceptance command; if it fails, fix your change and rerun; when "
     "it exits 0, write a summary of at most 3 sentences and STOP. Do not refactor, rename, "
     "reformat, add features, or edit files outside the allowed list. Never use git for anything "
-    "except status/diff/log/add/commit-free inspection; never push, fetch, merge, rebase, stash, "
-    "or change branches. If the spec is ambiguous or you have failed the same way three times, call "
+    "except status/diff/log/add — inspection and staging only, never commit (the supervisor "
+    "commits after review); never push, fetch, merge, rebase, stash, or change branches. If the "
+    "spec is ambiguous or you have failed the same way three times, call "
     "ask_supervisor or report_blocker instead of guessing. If a tool output ends with a line starting "
     "\"⚠ SUPERVISOR STEERING\", obey it immediately."
 )
@@ -708,10 +731,11 @@ SYSTEM_PROMPT = (
 # git_command_allowed enforcement above, so a blocked command reads as an
 # expected constraint instead of a mysterious tool failure.
 _TASK_GIT_ALLOWLIST_SENTENCE = (
-    "Git is restricted to inspection and local-only work — status, diff, log, show, add, blame, "
-    "grep, ls-files, rev-parse, apply, rm, mv, restore, safe branch/reset forms, merge-base, and "
-    "commit; every other subcommand (push, fetch, pull, merge, rebase, stash, tag, remote, "
-    "checkout, switch, and the rest) is blocked at the tool layer, not just discouraged here."
+    "Git is restricted to inspection and local staging — status, diff, log, show, add, blame, "
+    "grep, ls-files, rev-parse, apply, rm, mv, restore, safe branch forms, and merge-base; every "
+    "other subcommand (commit, push, fetch, pull, merge, rebase, reset, stash, tag, remote, "
+    "checkout, switch, and the rest) is blocked at the tool layer, not just discouraged here — "
+    "the supervisor commits and integrates after review."
 )
 TASK_SYSTEM_PROMPT = SYSTEM_PROMPT + " " + _TASK_GIT_ALLOWLIST_SENTENCE
 

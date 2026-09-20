@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import Defaults
 from jobs import create_worktree, runtime
-from worker_launcher import run_worker
+from worker_launcher import retry, run_worker
 
 _REAL_CREATE_SUBPROCESS_EXEC = asyncio.create_subprocess_exec
 
@@ -202,6 +202,48 @@ class TestFinalizePipelineWiring(_MockSubprocessCase):
 
         self.assertEqual(job["status"], "failed")
         self.assertEqual(job["error"], "could not start")
+        runtime.pop(job["taskId"], None)
+
+
+class TestRetryClearsStaleRuntime(_MockSubprocessCase):
+    """review_task(verdict='reject') re-spawns via worker_launcher.retry in
+    the SAME task id — a stale runtime entry (cancelled=True, an old proc
+    handle) left over from whatever happened to the rejected attempt must
+    not survive into the retry, or run_worker's `rt.get("cancelled")` check
+    finalizes the retry as cancelled the instant it produces a result,
+    regardless of what the worker actually reports."""
+
+    def _succeed_script(self) -> Path:
+        return _write_mock_script(self.mock_dir, "retry_ok.py", """
+            print('RESULT_JSON:{"status":"succeeded","turns":1,"summary":"done","cost_usd":0.01,"total_tokens":10}')
+        """)
+
+    async def test_stale_cancelled_flag_without_reset_wrongly_cancels_the_retry(self):
+        job = self._job_for()
+        cfg = _make_cfg(stall_timeout_s=300)
+        # Simulate the leftover from a previous attempt that WAS cancelled —
+        # this is the bug: nothing clears it before the retry runs.
+        runtime[job["taskId"]] = {"cancelled": True, "proc": object()}
+
+        with self._patched_exec(self._succeed_script(), cwd=job["worktree"]):
+            await retry(cfg, job, self._run_args(), feedback_history=[], timeout_ms=30_000)
+
+        self.assertEqual(job["status"], "cancelled")
+        runtime.pop(job["taskId"], None)
+
+    async def test_reset_runtime_before_retry_lets_it_finalize_normally(self):
+        job = self._job_for()
+        cfg = _make_cfg(stall_timeout_s=300)
+        runtime[job["taskId"]] = {"cancelled": True, "proc": object()}
+
+        # The fix review_task(verdict='reject') applies before creating the
+        # retry task.
+        runtime[job["taskId"]] = {}
+
+        with self._patched_exec(self._succeed_script(), cwd=job["worktree"]):
+            await retry(cfg, job, self._run_args(), feedback_history=[], timeout_ms=30_000)
+
+        self.assertEqual(job["status"], "succeeded")
         runtime.pop(job["taskId"], None)
 
 

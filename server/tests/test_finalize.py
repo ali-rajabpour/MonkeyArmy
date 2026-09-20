@@ -135,5 +135,47 @@ class TestFailedVerification(_FinalizeCase):
         self.assertEqual([s["name"] for s in job["verification"]["steps"]], ["test", "verify"])
 
 
+class TestFailedScopeCommittedFiles(_FinalizeCase):
+    """review-fix §C.1: `commit` used to be in the worker's git allowlist,
+    so a committed out-of-scope file left nothing in `changed_files`'
+    uncommitted porcelain — the scope check saw a clean worktree while
+    diff_and_stat(baseSha) still carried the file into the patch. The scope
+    check must also see anything committed since baseSha."""
+
+    def test_committed_out_of_scope_file_is_still_caught(self):
+        job = self._job(allowedFiles=["allowed/**/*.py"])
+        wt = job["worktree"]
+        (Path(wt) / "sneaky.txt").write_text("out of scope, committed\n", encoding="utf-8")
+        _git(wt, "add", "sneaky.txt")
+        _git(wt, "-c", "user.name=w", "-c", "user.email=w@w", "commit", "-m", "sneaky")
+
+        finalize_success(job, self._cfg())
+
+        self.assertEqual(job["status"], "failed_scope")
+        self.assertIn("sneaky.txt", job["scope"]["violations"])
+        self.assertIn("sneaky.txt", Path(job["patchPath"]).read_text(encoding="utf-8"))
+
+
+class TestBranchHistoryTamper(_FinalizeCase):
+    """review-fix §C.1: HEAD must still descend from baseSha before
+    anything else runs — a stray reset moving HEAD backward (or sideways)
+    must not reach staging/scope-check/commit at all."""
+
+    def test_head_reset_before_base_fails_closed(self):
+        # Give main a second commit so baseSha has a parent to reset back to.
+        _git(self.repo, "-c", "user.name=t", "-c", "user.email=t@t",
+             "commit", "--allow-empty", "-m", "second")
+        job = self._job()
+        wt = job["worktree"]
+        _git(wt, "reset", "--hard", f"{job['baseSha']}~1")
+
+        finalize_success(job, self._cfg())
+
+        self.assertEqual(job["status"], "failed_scope")
+        self.assertEqual(job["error"], "branch history tampered: HEAD no longer descends from baseSha")
+        self.assertIsNone(job.get("commitSha"))
+        self.assertIsNone(job.get("patchPath"))
+
+
 if __name__ == "__main__":
     unittest.main()

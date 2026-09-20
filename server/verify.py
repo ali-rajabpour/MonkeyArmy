@@ -26,7 +26,16 @@ from typing import Any
 
 from config import Defaults
 from events import publish
-from jobs import changed_files, commit_worktree, diff_and_stat, persist_job, stage_files, write_patch
+from jobs import (
+    branch_descends_from_base,
+    changed_files,
+    commit_worktree,
+    committed_files,
+    diff_and_stat,
+    persist_job,
+    stage_files,
+    write_patch,
+)
 from proc_utils import kill_tree
 from statusline_render import write_statusline
 
@@ -259,10 +268,24 @@ def finalize_success(job: dict[str, Any], cfg: Defaults) -> None:
         publish(job["repo"], job["taskId"], event)
 
     worktree = job["worktree"]
+
+    # Before anything else: a worker whose HEAD no longer descends from the
+    # base it started from (a stray reset, or worse) can't be trusted to
+    # scope-check or diff correctly against baseSha — refuse outright rather
+    # than stage or commit whatever is sitting there (I3).
+    if not branch_descends_from_base(worktree, job["baseSha"]):
+        job["status"] = "failed_scope"
+        job["error"] = "branch history tampered: HEAD no longer descends from baseSha"
+        _checkpoint("failed_scope")
+        return
+
     job["status"] = "verifying"
     _checkpoint("verifying")
 
-    changed = changed_files(worktree)
+    # Union of uncommitted porcelain and anything already committed since
+    # baseSha — a committed file has nothing to show in `changed_files`'
+    # porcelain status, so scope enforcement must look at both (I4).
+    changed = sorted(set(changed_files(worktree)) | set(committed_files(worktree, job["baseSha"])))
     scope = scope_check(changed, job.get("allowedFiles"))
     job["scope"] = scope
     in_scope = [f for f in changed if f not in scope["violations"]]
