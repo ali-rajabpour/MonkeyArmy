@@ -169,6 +169,15 @@ design draws today (see Roadmap for a container sandbox).
 See [`TOKEN-ECONOMICS.md`](TOKEN-ECONOMICS.md) for the granularity rule, what's enforced vs.
 advised, and the measurement protocol.
 
+## Operational caveat: tool-result compression
+
+9Router (and any proxy doing the same) can compress tool results on the way back to the model.
+Workers read files through tool results, so a compressed or summarised result silently changes
+what the worker believes the file contains — it then edits from a corrupted view and the diff
+looks inexplicable. Turn RTK / Caveman tool-result compression OFF for the worker key.
+`examples/toy-repo/fixtures/sentinel.txt` exists to catch this: validation step T1.4 has a
+worker copy it verbatim and compares the two files with `cmp`.
+
 ## Known upstream caveats
 
 ### deepagents `LocalShellBackend` timeout can hang forever on Windows
@@ -270,6 +279,17 @@ with deepagents 0.7.0a6.
   `filesChanged`, because a multi-attempt patch can touch a different set.
 - `batch(status|finish)` resolves `repo_path` from the manifest when it is omitted, which is how
   the skill calls it.
+
+2026-09-20 (invocation and install):
+- `monkey-army` no longer sets `disable-model-invocation: true` (plan §9.1 asked for it). The
+  user wants to reach the loop mid-conversation in plain language ("use monkey army for this
+  task"), which that flag forbids — it restricts loading to an explicit `/monkey-army`. The
+  description carries the guardrails instead: named triggers only, never for one-line fixes,
+  pure design, unknown-cause debugging, or work the user asked the supervisor itself to write.
+- Installation is a user-scope plugin (`claude plugin marketplace add <repo-or-path>` +
+  `claude plugin install`), not a bare MCP server registration: the plugin carries the skills
+  and the MCP server together, and user scope makes both available in every conversation.
+  `--plugin-dir` stays a testing-only path.
 
 ## VERIFY table (plan §14)
 

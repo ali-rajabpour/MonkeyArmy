@@ -22,12 +22,21 @@ does this for you up front.
   read files through tool results; compressing them corrupts what the worker sees.
 
 ## 3. Install the plugin in Claude Code
+```bash
+claude plugin marketplace add ali-rajabpour/MonkeyArmy
+claude plugin install monkey-army@monkey-army
 ```
-/plugin marketplace add ali-rajabpour/MonkeyArmy
-/plugin install monkey-army@monkey-army
+The marketplace source can also be a local path, which is the way to use a working copy that is
+not pushed anywhere:
+```bash
+claude plugin marketplace add /path/to/monkey-army
+claude plugin install monkey-army@monkey-army
 ```
-(Developing locally: `claude --plugin-dir /path/to/monkey-army`.) Run `/mcp` — you should see the
-`monkeys` server with 13 tools.
+Both install at user scope by default, so the plugin — its MCP server and its skills — is
+available in every conversation, with no `--plugin-dir` flag and no per-project setup. Use
+`claude --plugin-dir /path/to/monkey-army` only for throwaway testing of an uninstalled copy.
+
+Run `/mcp` — you should see the `monkeys` server with 13 tools.
 
 ## 4. Configure by talking (no restart, no env vars)
 Run `/monkey-setup` (saying "monkeys: set up" also triggers it). The supervisor will:

@@ -1,7 +1,6 @@
 ---
 name: monkey-army
-description: Run a coding task cheaply while you (an expensive frontier model) keep decomposition, specification, review and integration. Cheap worker models (DeepSeek & co. via the user's 9Router) type the code in isolated worktrees; the monkeys MCP server verifies objectively; you approve and merge. Triggered explicitly: /monkey-army, "unleash the monkeys", "cheap coder mode", "act as CTO", "delegate this build". Do not use for one-line fixes, pure design, or unknown-cause debugging.
-disable-model-invocation: true
+description: Delegate an implementation task to cheap worker models while you (an expensive frontier model) keep decomposition, specification, review and integration. Workers (DeepSeek & co. via the user's 9Router) type the code in isolated git worktrees; the monkeys MCP server verifies objectively; you approve and merge. Use when the user asks for this by name — "/monkey-army", "use monkey army for this", "unleash the monkeys", "delegate this to the monkeys", "cheap coder mode", "act as CTO" — or explicitly asks to delegate implementation work to the cheap workers. Not for one-line fixes, pure design, or debugging of unknown cause; not for work the user asked YOU to write.
 ---
 
 # Monkey Army — you command, monkeys type, you sign off

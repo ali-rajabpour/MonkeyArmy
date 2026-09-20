@@ -18,11 +18,28 @@ and reviewed and merged back by the supervisor — never idle tokens spent on ty
 ## Install in 5 steps
 
 1. Install `uv` (the only runtime the workers need).
-2. Have 9Router running with a combo (DeepSeek + fallbacks) and an API key.
-3. `/plugin marketplace add ali-rajabpour/MonkeyArmy` then
-   `/plugin install monkey-army@monkey-army`.
-4. Say **"monkeys: set up"** — no restart, no env vars, key never appears in chat.
+2. Have 9Router running with a combo (DeepSeek + fallbacks) and an API key. In the 9Router
+   dashboard, turn **RTK / Caveman tool-result compression OFF** for that key — workers read
+   files through tool results, and compressing them corrupts what the worker sees.
+3. Install the plugin once; it is then available in every conversation:
+   ```bash
+   claude plugin marketplace add ali-rajabpour/MonkeyArmy   # or a local path to this repo
+   claude plugin install monkey-army@monkey-army
+   ```
+4. Run `/monkey-setup` (or say "monkeys: set up") — no restart, no env vars, no file editing;
+   the key is entered in a secure dialog.
 5. Try it on a scratch repo: `/monkey-army add a subtract(a, b) function to calc/__init__.py...`.
+
+## Invoking it
+
+Installed plugins load in every conversation, so you can reach for the monkeys at any point:
+
+- `/monkey-army <task>` — start the delegation loop explicitly.
+- "use monkey army for this task", "delegate this to the monkeys" — mid-conversation, in plain
+  language; the supervisor loads the skill itself.
+- "should we delegate this?" — the lighter `monkey-assess` skill answers DELEGATE / DO IT
+  YOURSELF / BORDERLINE without dispatching anything.
+- `/monkey-setup` — configure or re-check the 9Router profile.
 
 Full walkthrough: [`docs/SETUP.md`](docs/SETUP.md).
 
