@@ -11,3 +11,6 @@ Screenshot*
 *.gif
 *.mov
 *.mp4
+
+# Session handoffs are local memory, never project source.
+.claude/handoffs/
