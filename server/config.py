@@ -20,9 +20,21 @@ def home_dir() -> Path:
 
     Read live on every call (never cached) so a test's `setUp` — or a
     supervisor session that changes it mid-run — takes effect immediately.
+
+    Resolved to a real path: on macOS a temp dir handed in via the override
+    lives at `/var/folders/...`, whose real path is `/private/var/folders/...`.
+    deepagents' `virtual_mode` remaps an absolute path under the worktree
+    root, so a worker writing one (often echoing `pwd`) created
+    `<worktree>/private/var/...` — files that then failed the scope check for
+    a reason neither the worker nor the supervisor could see. Resolving here
+    makes the worktree path and the worker's own `pwd` agree.
     """
     override = os.environ.get("MONKEY_ARMY_HOME")
-    return Path(override) if override else Path.home() / ".monkey-army"
+    base = Path(override) if override else Path.home() / ".monkey-army"
+    try:
+        return base.resolve()
+    except OSError:
+        return base
 
 
 @dataclass(frozen=True)

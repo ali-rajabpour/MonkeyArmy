@@ -36,7 +36,7 @@ class TestEventBus(unittest.TestCase):
     def test_log_path_lives_outside_the_repo(self):
         path = events.log_path(self.repo, "t_1")
         self.assertNotIn(str(Path(self.repo).resolve()), str(path))
-        self.assertTrue(str(path).startswith(os.environ["MONKEY_ARMY_HOME"]))
+        self.assertTrue(str(path).startswith(os.path.realpath(os.environ["MONKEY_ARMY_HOME"])))
 
     def test_subscriber_receives_then_unsubscribed_does_not(self):
         q = events.subscribe()

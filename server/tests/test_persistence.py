@@ -86,7 +86,7 @@ class TestReposIndex(PersistenceTestCase):
     def test_repo_state_dir_is_outside_the_repo(self):
         state_dir = repo_state_dir(self.repo)
         self.assertNotIn(str(Path(self.repo).resolve()), str(state_dir))
-        self.assertTrue(str(state_dir).startswith(os.environ["MONKEY_ARMY_HOME"]))
+        self.assertTrue(str(state_dir).startswith(os.path.realpath(os.environ["MONKEY_ARMY_HOME"])))
 
 
 class TestPersistenceFormat(PersistenceTestCase):

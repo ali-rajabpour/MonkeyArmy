@@ -59,7 +59,7 @@ class TestCreateWorktree(JobsTestCase):
     def test_worktree_lives_outside_the_repo_and_registers_in_repos_index(self):
         wt = create_worktree(self.repo, "main")
         self.assertNotIn(str(Path(self.repo).resolve()), wt["worktree"])
-        self.assertTrue(wt["worktree"].startswith(os.environ["MONKEY_ARMY_HOME"]))
+        self.assertTrue(wt["worktree"].startswith(os.path.realpath(os.environ["MONKEY_ARMY_HOME"])))
         self.assertEqual(wt["slug"], slug_for(self.repo))
         self.assertIn(str(Path(self.repo).resolve()), all_repos())
         self.assertEqual(wt["baseBranch"], "main")
