@@ -60,7 +60,12 @@ class Defaults:
     max_budget_usd: float = 0.50
     max_tokens_total: int = 400000
     timeout_s: int = 900
-    stall_s: int = 180
+    # 300, not 180: the watchdog measures stdout SILENCE, and one reasoning
+    # model call emits nothing for minutes. At 180 a live run killed four of
+    # eight healthy workers mid-task. The worker now heartbeats while it
+    # waits (worker.py Heartbeat) and each request has its own timeout, so
+    # this is the backstop for a worker that has genuinely stopped talking.
+    stall_s: int = 300
     command_timeout_s: int = 120
     ask_timeout_s: int = 600
     recursion_limit_micro: int = 80

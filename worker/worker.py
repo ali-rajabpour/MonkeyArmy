@@ -37,6 +37,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
@@ -55,6 +56,10 @@ DEFAULT_COMMAND_TIMEOUT = 120
 DEFAULT_ASK_TIMEOUT = 600
 DEFAULT_RECURSION_LIMIT_MICRO = 80
 DEFAULT_RECURSION_LIMIT_TASK = 400
+# Seconds for one model call. Longer than any healthy reasoning call
+# observed live (~4 min), short enough that a genuine hang ends the
+# task instead of burning its whole wall-clock budget.
+DEFAULT_MODEL_REQUEST_TIMEOUT = 600
 
 # Whole-drive scans (`find /`, `find C:/`) once froze a delegation for 20+
 # minutes. The per-command timeout now bounds the damage, but there is never
@@ -210,6 +215,51 @@ def git_command_allowed(command: str) -> tuple[bool, str]:
             return False, _GIT_BLOCKED_MSG.format(sub=sub)
 
     return True, ""
+
+
+class Heartbeat:
+    """Emit a PROGRESS line every `interval` seconds while the agent is busy.
+
+    The server's stall watchdog measures stdout SILENCE, but a single model
+    call produces no output at all — so a reasoning model thinking for four
+    minutes looked exactly like a hung process and got killed mid-task (four
+    of eight tasks in one live run). The heartbeat keeps the channel honest:
+    silence now really does mean stuck, while a slow call reports how long it
+    has been waiting. A genuinely hung request is caught by the per-request
+    timeout on the model instead (see build_model), which is the layer that
+    can actually tell.
+    """
+
+    def __init__(self, interval: int = 30) -> None:
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._started_at = 0.0
+
+    def start(self) -> None:
+        self._started_at = time.time()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Idempotent — called on both the normal and the failure path."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def beat(self) -> None:
+        """Called on every real step, so the idle clock starts from there."""
+        self._started_at = time.time()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            # Compare in floats; truncating to int first made the threshold
+            # depend on the interval's magnitude (int(0.3) == 0 never beats a
+            # 0.05s interval), which hid the whole mechanism under test.
+            idle = time.time() - self._started_at
+            if idle >= self._interval:
+                emit_progress({"kind": "waiting", "note": f"waiting on model ({int(idle)}s)"})
 
 
 def emit_progress(payload: dict) -> None:
@@ -807,6 +857,9 @@ def build_model(
     kwargs = dict(model_kwargs) if model_kwargs else {}
     if fallback_models:
         kwargs["fallbacks"] = list(fallback_models)
+    # A hung request must die at the provider layer, not be guessed at by the
+    # server's stdout-silence watchdog. Profile model_kwargs can override it.
+    kwargs.setdefault("timeout", DEFAULT_MODEL_REQUEST_TIMEOUT)
     return ChatLiteLLM(
         model=_bare_model(model),
         api_base=api_base,
@@ -995,6 +1048,8 @@ def main() -> int:
         accumulated_messages: list = []
         budget_exceeded = False
         budget_reason = ""
+        heartbeat = Heartbeat()
+        heartbeat.start()
         for update in agent.stream(
             invoke_state,
             config={"recursion_limit": recursion_limit},
@@ -1018,6 +1073,7 @@ def main() -> int:
                 if note:
                     payload["note"] = note
                 emit_progress(payload)
+                heartbeat.beat()
 
                 # Stop as soon as either cap is crossed, rather than running
                 # unbounded — checked after every step so the overrun is at
@@ -1039,6 +1095,7 @@ def main() -> int:
             if budget_exceeded:
                 break
 
+        heartbeat.stop()
         messages = accumulated_messages
         result["turns"] = len(messages)
         result["summary"] = _last_message_content(messages)
@@ -1055,6 +1112,7 @@ def main() -> int:
         else:
             result["status"] = "succeeded"
     except Exception as e:  # noqa: BLE001 - surface any failure to the supervisor as a structured result
+        heartbeat.stop()
         result["error"] = f"{type(e).__name__}: {e}"
 
     # Metering is recorded regardless of success/failure so the supervisor

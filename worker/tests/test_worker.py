@@ -18,6 +18,7 @@ Not part of server/'s stdlib-only suite (worker.py needs the heavy deepagents
 import json
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,7 +54,7 @@ class TestBuildModel(unittest.TestCase):
     def test_no_fallbacks_means_no_fallbacks_key(self):
         model = worker.build_model("openai/combo/deepseek-main", None, None, [], {"temperature": 0.2})
         self.assertNotIn("fallbacks", model.model_kwargs)
-        self.assertEqual(model.model_kwargs, {"temperature": 0.2})
+        self.assertEqual(model.model_kwargs["temperature"], 0.2)
 
     def test_bare_model_strips_legacy_colon_prefix_only(self):
         self.assertEqual(worker._bare_model("litellm:openai/combo-deepseek-main"), "openai/combo-deepseek-main")
@@ -340,6 +341,54 @@ class TestSelftest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("SELFTEST_OK", proc.stdout)
+
+
+class TestHeartbeat(unittest.TestCase):
+    """A live run killed four of eight healthy workers because one reasoning
+    model call emits no stdout for minutes and the server's watchdog reads
+    silence as a hang."""
+
+    def test_emits_while_idle_and_stops(self):
+        import io, contextlib
+        hb = worker.Heartbeat(interval=0.05)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hb.start()
+            time.sleep(0.3)
+            hb.stop()
+        lines = [l for l in buf.getvalue().splitlines() if l.startswith("PROGRESS:")]
+        self.assertTrue(lines, "heartbeat emitted nothing while idle")
+        self.assertIn("waiting on model", lines[0])
+        # and nothing more after stop()
+        before = len(lines)
+        time.sleep(0.2)
+        self.assertEqual(len(buf.getvalue().splitlines()), before)
+
+    def test_beat_resets_the_idle_clock(self):
+        import io, contextlib
+        hb = worker.Heartbeat(interval=0.2)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hb.start()
+            for _ in range(4):       # steady progress: never idle long enough
+                time.sleep(0.08)
+                hb.beat()
+            hb.stop()
+        self.assertEqual(buf.getvalue().strip(), "")
+
+    def test_stop_is_idempotent(self):
+        hb = worker.Heartbeat(interval=0.05)
+        hb.start()
+        hb.stop()
+        hb.stop()
+
+    def test_model_gets_a_request_timeout(self):
+        m = worker.build_model("openai/x", None, None, [], {})
+        self.assertEqual(m.model_kwargs["timeout"], worker.DEFAULT_MODEL_REQUEST_TIMEOUT)
+
+    def test_profile_can_override_the_request_timeout(self):
+        m = worker.build_model("openai/x", None, None, [], {"timeout": 42})
+        self.assertEqual(m.model_kwargs["timeout"], 42)
 
 
 if __name__ == "__main__":

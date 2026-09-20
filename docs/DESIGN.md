@@ -331,6 +331,15 @@ with deepagents 0.7.0a6.
   keeps the name `monkey-army` (that is the name people type and say); everything else is
   `setup`, `assess`, `status`, `repair`, `reset`.
 
+2026-09-21 (stall watchdog vs. reasoning models):
+- The worker heartbeats (`Heartbeat`, a PROGRESS line every 30 s carrying idle seconds) while a
+  model call is in flight, each request carries its own timeout
+  (`DEFAULT_MODEL_REQUEST_TIMEOUT`, 600 s, overridable per profile), and `stall_s` defaults to
+  300 rather than 180. Evidence: a live run against a reasoning model (`deepseek-flash`) killed
+  four of eight healthy workers. The watchdog measures stdout silence, and one model call emits
+  nothing for minutes, so slow was indistinguishable from hung. The heartbeat makes silence mean
+  stuck again; the per-request timeout is the layer that can actually end a hung call.
+
 ## VERIFY table (plan §14)
 
 | Claim | Outcome | Evidence / fallback taken |
