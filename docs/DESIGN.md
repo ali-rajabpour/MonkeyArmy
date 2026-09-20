@@ -245,6 +245,45 @@ with deepagents 0.7.0a6.
 - `--worktree`/`--brief` are optional in the worker's argparse (checked manually after the
   `--selftest` branch) so `worker.py --selftest` runs without them.
 
+2026-09-20 (review-fix pass):
+- Every blocking call in a tool body (git, HTTP probe, `uv run --selftest`, verification
+  commands) runs through `_offload` on an executor thread. Blocking the loop stops worker
+  stdout from being drained, which fills the pipe and shows up as a false "stall".
+- `Defaults` is loaded per tool call (`_cfg()`), never once at import, so
+  `configure(set_defaults)` takes effect without a Claude Code restart. `write_statusline` is
+  fully best-effort (broad `except`) and `jobs.all_jobs()` retries once on `RuntimeError`,
+  because both can now run while another thread mutates the registry.
+- The probe cache is invalidated on `set_profile`, `remove_profile`, `set_default` and
+  `store_key`, so a fixed (or broken) profile is re-probed instead of trusting a 10-minute-old
+  verdict.
+- Workers may no longer run `git commit` or `git reset`, and `finalize_success` scope-checks
+  committed files as well as the working tree, plus asserts `HEAD` still descends from
+  `baseSha`. A worker that committed an out-of-scope file would otherwise pass the scope check
+  while the file still rode into the patch.
+- `git -c`, `-C`, `--git-dir`, `--work-tree`, `--exec-path` and `--namespace` are blocked
+  outright: a command-line `-c` outranks the `GIT_CONFIG_*` environment block, and the path
+  options point git at another repository. `--no-pager`/`-p`/`--paginate` stay allowed.
+- A rejected task resets `runtime[task_id]` before respawning, so a stale `cancelled` flag from
+  the previous attempt cannot finalize the retry as cancelled.
+- An empty diff is a failure (`worker made no changes`), not a success with nothing in it.
+- `integrate` derives the dirty-overlap file set from the patch it is about to apply, not from
+  `filesChanged`, because a multi-attempt patch can touch a different set.
+- `batch(status|finish)` resolves `repo_path` from the manifest when it is omitted, which is how
+  the skill calls it.
+
+## VERIFY table (plan §14)
+
+| Claim | Outcome | Evidence / fallback taken |
+|---|---|---|
+| `ChatLiteLLM` accepts `api_base` and `api_key` constructor fields | TRUE | `ChatLiteLLM.model_fields` lists `model, api_key, api_base, custom_llm_provider, temperature, model_kwargs` (langchain-litellm 0.7.2). No fallback needed. |
+| `litellm.completion(model="openai/combo/x", api_base=…)` sends `model="combo/x"` | TRUE | `litellm.get_llm_provider("openai/combo/deepseek-main", api_base=…)` → `('combo/deepseek-main', 'openai')` (litellm 1.101.0). Confirmed offline; a live 9Router call is still pending. |
+| `RubricMiddleware(model=<BaseChatModel>)` accepted | TRUE | Signature is `model: str \| BaseChatModel` (deepagents 0.7.15). |
+| `SubAgent` dict accepts a model instance under `"model"` | TRUE | `SubAgent.__annotations__["model"]` is `NotRequired[str \| BaseChatModel]`. |
+| `git apply --check --3way` accepted together | ACCEPTED BUT UNUSABLE | The pair exits 0 on a patch that conflicts, and the real `--3way` apply leaves `UU` markers. Fallback taken: strict `git apply --index --check` / `git apply --index`. |
+| Claude Code MCP per-call tool timeout env var name/default | PARTIALLY VERIFIED | Claude Code 2.1.278 has `MCP_TOOL_TIMEOUT` (ms) plus a per-server `timeout` field that overrides it ("values below 1000ms are ignored"); also `MCP_TIMEOUT`, `MCP_TOOL_IDLE_TIMEOUT`, `MCP_CONNECT_TIMEOUT_MS`. The numeric default is a minified constant and was not extracted, so the docs point at the version's own documentation. `wait_for_tasks` caps itself at 170 s regardless. |
+| Claude Code honours `disable-model-invocation: true` in plugin skills | NOT VERIFIED | Kept on `monkey-army` as the plan specifies; harmless if ignored. `monkey-setup` deliberately omits it so plain text can reach the setup flow. |
+| 9Router `/v1/models` lists combos as `combo/<id>` | PENDING | Needs the live run; `discover_models` falls back to reporting all ids, and the user can name the combo by hand. |
+
 ## §6 tool count note
 
 §6 of the implementation plan is titled "MCP tool surface (exactly these 12 ...)" but its own
