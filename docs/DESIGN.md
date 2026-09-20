@@ -291,6 +291,14 @@ with deepagents 0.7.0a6.
   and the MCP server together, and user scope makes both available in every conversation.
   `--plugin-dir` stays a testing-only path.
 
+2026-09-20 (plugin MCP declaration):
+- The server is declared inline in `.claude-plugin/plugin.json` (`mcpServers` object), not in a
+  root `.mcp.json` as plan §4 wrote it. A root `.mcp.json` is also read as an ordinary *project*
+  MCP config whenever a session runs inside this repo, where `${CLAUDE_PLUGIN_ROOT}` is
+  undefined; that copy fails to connect and shadows the plugin's own server of the same name, so
+  the tools disappear exactly when you are developing the plugin. Inline declaration removes the
+  duplicate entirely. `claude plugin validate .` passes.
+
 ## VERIFY table (plan §14)
 
 | Claim | Outcome | Evidence / fallback taken |

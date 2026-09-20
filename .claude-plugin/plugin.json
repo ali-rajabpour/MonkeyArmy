@@ -3,10 +3,27 @@
   "displayName": "Monkey Army",
   "version": "0.1.0",
   "description": "Opus commands, monkeys type, Opus signs off: delegate micro-tasks from a frontier-model Claude Code supervisor to cheap workers (DeepSeek & co. via 9Router), isolated in git worktrees, verified by the server, reviewed and merged back by the supervisor.",
-  "author": { "name": "Ali Rajabpour" },
+  "author": {
+    "name": "Ali Rajabpour"
+  },
   "repository": "https://github.com/ali-rajabpour/MonkeyArmy",
   "license": "MIT",
-  "keywords": ["delegation", "mcp", "cost-optimization", "deepseek", "9router", "worktree"],
+  "keywords": [
+    "delegation",
+    "mcp",
+    "cost-optimization",
+    "deepseek",
+    "9router",
+    "worktree"
+  ],
   "skills": "./skills",
-  "mcpServers": "./.mcp.json"
+  "mcpServers": {
+    "monkeys": {
+      "command": "uv",
+      "args": [
+        "run",
+        "${CLAUDE_PLUGIN_ROOT}/server/main.py"
+      ]
+    }
+  }
 }
