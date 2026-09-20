@@ -39,7 +39,14 @@ Installed plugins load in every conversation, so you can reach for the monkeys a
   language; the supervisor loads the skill itself.
 - "should we delegate this?" — the lighter `monkey-assess` skill answers DELEGATE / DO IT
   YOURSELF / BORDERLINE without dispatching anything.
-- `/monkey-setup` — configure or re-check the 9Router profile.
+- `/monkey-setup` — first-run configuration (URL, profile, key, combo, probe).
+- `/monkey-status` — what is configured now, and is it healthy. Read-only.
+- `/monkey-repair` — fix one thing: model, URL, prices, fallback, key, default, or drop a profile.
+- `/monkey-reset` — delete every profile and stored key and start over (two-step; keeps your task
+  history, patches and notes).
+
+Commands are namespaced, so the full form is `/monkey-army:monkey-status` — type `/monkey` and the
+menu will show them.
 
 Full walkthrough: [`docs/SETUP.md`](docs/SETUP.md).
 

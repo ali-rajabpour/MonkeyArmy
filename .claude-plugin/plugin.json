@@ -25,5 +25,6 @@
         "${CLAUDE_PLUGIN_ROOT}/server/main.py"
       ]
     }
-  }
+  },
+  "commands": "./commands"
 }

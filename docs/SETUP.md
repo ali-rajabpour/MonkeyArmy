@@ -88,7 +88,16 @@ cp <plugin>/statusline/monkey-army-statusline.sh ~/.claude/ && chmod +x ~/.claud
 
 ## Changing or resetting the configuration
 
-Run `/monkey-setup` again and say what is wrong — it maps your request to the smallest change:
+Four commands cover the whole lifecycle (full form `/monkey-army:<name>`; typing `/monkey` lists them):
+
+| Command | Use it for |
+|---|---|
+| `/monkey-setup` | first-run configuration |
+| `/monkey-status` | what is configured, and is it healthy (read-only) |
+| `/monkey-repair` | change one thing — model, URL, prices, fallback, key, default, or remove a profile |
+| `/monkey-reset` | delete every profile and stored key, then start over |
+
+`/monkey-repair` maps your request to the smallest change:
 
 - a wrong URL, model, price or fallback → the profile is overwritten in place, key untouched;
 - a wrong key → the dialog opens again and replaces it;
