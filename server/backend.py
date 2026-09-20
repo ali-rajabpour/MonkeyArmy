@@ -6,6 +6,7 @@ worker tokens on it (`probe`), and a composite health check (`doctor`).
 
 from __future__ import annotations
 
+import functools
 import json
 import shutil
 import subprocess
@@ -36,6 +37,73 @@ def _bare_model_for_http(model: str) -> str:
     return model.split("/", 1)[1] if "/" in model else model
 
 
+def _never_raises(fn):
+    """Wrap a network entry point so an unexpected failure is a payload, not a
+    crashed tool call.
+
+    Field lesson: a JSONDecodeError inside probe escaped all the way out of
+    the MCP tool, so the supervisor saw "Error executing tool configure:
+    Extra data: line 1 column 578" with no profile, no status, nothing to act
+    on. Every failure here belongs in the result.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001 - deliberate boundary
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return wrapper
+
+
+def _parse_body(raw: str) -> Any:
+    """Parse a response body that is *supposed* to be one JSON object.
+
+    Real proxies are messier than the spec: 9Router can answer a
+    /chat/completions call with server-sent events (`data: {...}` lines, a
+    trailing `data: [DONE]`) or append a second document after the first.
+    A plain json.loads then raises `Extra data: line 1 column N`, and before
+    this the exception escaped the tool call entirely ("Error executing tool
+    configure") instead of being reported as a failed probe.
+
+    Order: whole document, then SSE frames (last real one wins — that is the
+    completed message), then the first JSON value with trailing bytes
+    ignored. Anything else comes back as a structured error carrying a short
+    snippet, so the cause is visible without reading server logs.
+    """
+    raw = raw.strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except ValueError:
+        pass
+
+    if "data:" in raw:
+        frames = [
+            line[len("data:"):].strip()
+            for line in raw.splitlines()
+            if line.strip().startswith("data:")
+        ]
+        for frame in reversed(frames):
+            if not frame or frame == "[DONE]":
+                continue
+            try:
+                return json.loads(frame)
+            except ValueError:
+                continue
+
+    try:
+        value, end = json.JSONDecoder().raw_decode(raw)
+    except ValueError:
+        return {
+            "error": "response was not JSON",
+            "snippet": raw[:300],
+        }
+    if isinstance(value, dict) and end < len(raw):
+        value.setdefault("_trailing_bytes", len(raw) - end)
+    return value
+
+
 def _request(
     url: str, api_key: str | None, *, method: str = "GET",
     body: dict[str, Any] | None = None, timeout_s: float = 10,
@@ -51,7 +119,7 @@ def _request(
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             raw = resp.read().decode("utf-8")
-            return resp.status, (json.loads(raw) if raw else {})
+            return resp.status, _parse_body(raw)
     except urllib.error.HTTPError as e:
         try:
             payload = json.loads(e.read().decode("utf-8"))
@@ -62,6 +130,7 @@ def _request(
         return 0, {"error": f"{type(e).__name__}: {e}"}
 
 
+@_never_raises
 def discover_models(profile: dict[str, Any], timeout_s: float = 10) -> dict[str, Any]:
     api_base = profile.get("api_base")
     if not api_base:
@@ -70,9 +139,23 @@ def discover_models(profile: dict[str, Any], timeout_s: float = 10) -> dict[str,
     if status != 200:
         return {"error": f"GET /models -> HTTP {status}", "detail": body}
     ids = [m.get("id") for m in (body.get("data") or []) if isinstance(m, dict) and m.get("id")]
-    return {"models": ids, "combos": [i for i in ids if i.startswith("combo/")]}
+    # 9Router's own combos may or may not carry a `combo/` prefix — one
+    # deployment advertises `combo/coder`, another plain `coder` (verified
+    # against a live router). `combos` is therefore a hint, never the list to
+    # choose from: callers offer `models` when it comes back empty.
+    combos = [i for i in ids if i.startswith("combo/")]
+    return {
+        "models": ids,
+        "combos": combos,
+        "note": (
+            "this endpoint does not prefix combos with 'combo/' — pick from `models` and use "
+            "the id verbatim after the provider prefix, e.g. openai/<id>"
+            if ids and not combos else None
+        ),
+    }
 
 
+@_never_raises
 def probe(profile: dict[str, Any], ttl_s: int = 600, timeout_s: float = 30) -> dict[str, Any]:
     """POST a tiny tool-calling round trip; cache the verdict per profile
     name for `ttl_s` so dispatch_task doesn't re-probe on every call."""
@@ -183,6 +266,7 @@ def _repo_orphans(repo_path: str) -> dict[str, Any]:
     return {"worktrees": worktrees, "branches": branches}
 
 
+@_never_raises
 def doctor(repo_path: str | None = None) -> list[dict[str, Any]]:
     """Composite health check for `configure(action='doctor')` (§6.13)."""
     checks: list[dict[str, Any]] = []

@@ -314,6 +314,17 @@ with deepagents 0.7.0a6.
   `discover_models` therefore accept `api_key_env_var`/`api_base` with no profile — credentials
   are keyed by env var name, not by profile, so nothing about that is a special case.
 
+2026-09-20 (live-run fixes):
+- `backend._parse_body` tolerates SSE frames and a trailing document instead of calling
+  `json.loads` on the raw body. A live 9Router answered a probe with extra bytes after the JSON;
+  the `JSONDecodeError` escaped the MCP tool as "Error executing tool configure: Extra data:
+  line 1 column 578" with no payload to act on.
+- `probe`, `discover_models` and `doctor` are wrapped so they never raise: a network entry point
+  returns its failure as a result, because a crashed tool call tells the supervisor nothing.
+- `combos` from `/v1/models` is a hint, not the menu. One router advertises `combo/<id>`,
+  another plain `<id>` (verified live). The wizard offers `models` when `combos` is empty and
+  uses the id verbatim after the provider prefix.
+
 ## VERIFY table (plan §14)
 
 | Claim | Outcome | Evidence / fallback taken |
@@ -325,7 +336,7 @@ with deepagents 0.7.0a6.
 | `git apply --check --3way` accepted together | ACCEPTED BUT UNUSABLE | The pair exits 0 on a patch that conflicts, and the real `--3way` apply leaves `UU` markers. Fallback taken: strict `git apply --index --check` / `git apply --index`. |
 | Claude Code MCP per-call tool timeout env var name/default | PARTIALLY VERIFIED | Claude Code 2.1.278 has `MCP_TOOL_TIMEOUT` (ms) plus a per-server `timeout` field that overrides it ("values below 1000ms are ignored"); also `MCP_TIMEOUT`, `MCP_TOOL_IDLE_TIMEOUT`, `MCP_CONNECT_TIMEOUT_MS`. The numeric default is a minified constant and was not extracted, so the docs point at the version's own documentation. `wait_for_tasks` caps itself at 170 s regardless. |
 | Claude Code honours `disable-model-invocation: true` in plugin skills | NOT VERIFIED | Kept on `monkey-army` as the plan specifies; harmless if ignored. `monkey-setup` deliberately omits it so plain text can reach the setup flow. |
-| 9Router `/v1/models` lists combos as `combo/<id>` | PENDING | Needs the live run; `discover_models` falls back to reporting all ids, and the user can name the combo by hand. |
+| 9Router `/v1/models` lists combos as `combo/<id>` | FALSE on at least one deployment | A live router listed combos unprefixed (`coder`, `coder-fast`, `daily`), so `combos` came back empty and `openai/combo/coder` failed with `No active credentials for provider: combo`. Fallback taken: treat `combos` as a hint, offer `models`, use the id verbatim (`openai/coder`). |
 
 ## §6 tool count note
 

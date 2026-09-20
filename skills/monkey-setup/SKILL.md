@@ -48,7 +48,13 @@ edits a file and never sets an environment variable.
 ```
 configure(action="discover_models", api_base=<url>, api_key_env_var="MONKEY_9ROUTER_KEY")
 ```
-Again, no profile needed. Present the returned combos and ask the user which one to use.
+Again, no profile needed. Present the returned ids and ask the user which one to use.
+
+`combos` is only a hint: some routers advertise `combo/<id>`, others plain `<id>`. If `combos`
+is empty, offer everything in `models` — do not invent a `combo/` prefix. The model string is
+`openai/<id exactly as the endpoint listed it>`, e.g. `openai/coder` for an id of `coder` and
+`openai/combo/coder` for an id of `combo/coder`. Getting this wrong is the most common cause of
+a probe failing with `model_not_found` / `No active credentials for provider`.
 
 If this fails, the URL or the key is wrong — fix that here, before anything is written to the
 config. That is the whole point of doing it at this stage.
@@ -59,7 +65,7 @@ config. That is the whole point of doing it at this stage.
 
 ## 6. Create the profile — once, complete
 ```
-configure(action="set_profile", name=<profile>, model="openai/combo/<chosen>", api_base=<url>,
+configure(action="set_profile", name=<profile>, model="openai/<chosen id, verbatim>", api_base=<url>,
           api_key_env_var="MONKEY_9ROUTER_KEY", fallback_models=[...]?,
           price_input_per_mtok=<?>, price_output_per_mtok=<?>)
 ```

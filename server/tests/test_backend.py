@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -176,6 +177,38 @@ class TestBareModelForHttp(unittest.TestCase):
 
     def test_no_prefix_is_unchanged(self):
         self.assertEqual(backend._bare_model_for_http("bare-model"), "bare-model")
+
+
+class TestResponseParsing(unittest.TestCase):
+    """A real router answered a probe with a second document appended, and the
+    JSONDecodeError escaped the MCP tool ("Extra data: line 1 column 578")
+    instead of coming back as a failed probe."""
+
+    def test_plain_object(self):
+        self.assertEqual(backend._parse_body('{"a": 1}'), {"a": 1})
+
+    def test_empty_body(self):
+        self.assertEqual(backend._parse_body(""), {})
+
+    def test_trailing_document_is_ignored_but_counted(self):
+        parsed = backend._parse_body('{"a": 1}\n{"b": 2}')
+        self.assertEqual(parsed["a"], 1)
+        self.assertIn("_trailing_bytes", parsed)
+
+    def test_server_sent_events(self):
+        raw = 'data: {"choices": [{"index": 0}]}\n\ndata: [DONE]\n'
+        self.assertEqual(backend._parse_body(raw), {"choices": [{"index": 0}]})
+
+    def test_non_json_reports_a_snippet(self):
+        parsed = backend._parse_body("<html>502 Bad Gateway</html>")
+        self.assertEqual(parsed["error"], "response was not JSON")
+        self.assertIn("502", parsed["snippet"])
+
+    def test_probe_never_raises(self):
+        with mock.patch.object(backend, "_request", side_effect=RuntimeError("boom")):
+            result = backend.probe({"name": "p", "model": "openai/x", "api_base": "http://x/v1"}, ttl_s=0)
+        self.assertFalse(result["ok"])
+        self.assertIn("RuntimeError: boom", result["error"])
 
 
 if __name__ == "__main__":
