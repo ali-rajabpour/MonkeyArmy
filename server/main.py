@@ -27,6 +27,7 @@ from mcp.server.fastmcp import FastMCP
 
 import backend
 import batches
+import config
 import events
 import git_ops
 import store
@@ -51,9 +52,10 @@ from proc_utils import kill_tree
 from worker_launcher import comm_dir_for, run_worker
 
 def _cfg() -> Defaults:
-    """Reload config.json's `defaults` section on every call, so
-    configure(action='set_defaults') takes effect on the next tool call —
-    no restart needed. A module-level `cfg = load_defaults()` here would
+    """Reload the env-only defaults on every call, so a MONKEY_* variable
+    changed in the shell takes effect on the next tool call (after a
+    restart — env vars are fixed for the life of this process, unlike the
+    old config.json). A module-level `cfg = load_defaults()` here would
     freeze these values at import time (§ review-fix B)."""
     return load_defaults()
 
@@ -76,10 +78,10 @@ async def _offload(fn, *args, **kwargs):
 @mcp.tool(
     description=(
         "Starts an autonomous coding worker on an isolated git worktree and returns a task_id "
-        "IMMEDIATELY — the worker runs in the background and you stay free. Probes the profile "
-        "first and refuses before creating anything if it fails. allowed_files unrestricted is "
-        "allowed but returned as a warning. Supervise with wait_for_tasks, not polling; review "
-        "with task_result then review_task/integrate_task when done."
+        "IMMEDIATELY — the worker runs in the background and you stay free. Checks env config and "
+        "probes the endpoint first, refusing before creating anything if either fails. "
+        "allowed_files unrestricted is allowed but returned as a warning. Supervise with "
+        "wait_for_tasks, not polling; review with task_result then review_task/integrate_task."
     )
 )
 async def dispatch_task(
@@ -91,7 +93,6 @@ async def dispatch_task(
     allowed_files: list[str] | None = None,
     context_files: list[str] | None = None,
     mode: str = "micro",
-    profile: str | None = None,
     batch_id: str | None = None,
     batch_key: str | None = None,
     base_branch: str | None = None,
@@ -105,24 +106,25 @@ async def dispatch_task(
     if mode not in ("micro", "task"):
         return json.dumps({"error": f"mode must be 'micro' or 'task', got {mode!r}"})
 
+    # Env config resolved fresh on every call (config.py is the only source —
+    # env-config-spec.md). Every missing/invalid required variable is
+    # reported together, before anything is created, and before the repo
+    # check: a machine that isn't configured at all should say so first.
+    resolved = config.required_config()
+    if resolved["errors"]:
+        return json.dumps({"error": "; ".join(resolved["errors"])})
+
     repo_err = await _offload(repo_worktree_error, repo_path)
     if repo_err:
         return json.dumps({"error": repo_err})
 
-    # Resolve model/key per task from the config store (facade profiles).
-    # Read fresh each call so facade changes apply without a server restart.
-    try:
-        resolved = store.resolve_profile(profile)
-    except KeyError as e:
-        return json.dumps({"error": str(e)})
-
     # Probe BEFORE creating anything (§6.1 step 2): a dead endpoint or wrong
     # model name must never leave a worktree/branch behind for the supervisor
     # to clean up.
-    probe_result = await _offload(backend.probe, resolved, ttl_s=cfg.probe_ttl_s)
+    probe_result = await _offload(backend.probe, _probe_profile(resolved), ttl_s=cfg.probe_ttl_s)
     if not probe_result.get("ok"):
         return json.dumps({
-            "error": f"profile {resolved['name']!r} failed its health probe: "
+            "error": f"health probe failed for model {resolved['model']!r}: "
                      f"{probe_result.get('error', 'no choices in response')}",
             "probe": probe_result,
         })
@@ -148,13 +150,13 @@ async def dispatch_task(
         "testCommand": test_command, "definitionOfDone": definition_of_done,
         "verifyCommand": verify_command, "lintCommand": lint_command,
         "allowedFiles": allowed_files or [], "contextFiles": context_files or [],
-        "mode": mode, "profile": resolved["name"],
+        "mode": mode,
         "status": "running", "attempt": 1, "turns": 0,
         "costUsd": None, "totalTokens": None, "priced": False, "modelsSeen": [],
         "model": resolved["model"],  # for the status line / watch stream
         # Persisted (not just passed to this run) so review_task's retry —
         # possibly after a server restart — reuses the same caps rather than
-        # silently reverting to the profile's defaults.
+        # silently reverting to the env defaults.
         "maxBudgetUsd": max_budget_usd, "maxTokensTotal": max_tokens_total, "timeoutS": timeout_s,
     }
     if batch_id:
@@ -189,11 +191,10 @@ async def dispatch_task(
                 {"kind": "preflight", "note": f"test_command exit={preflight_report.get('exit_code')}"},
             )
 
-        limits = resolved["limits"]
-        args = worker_launcher.build_worker_args(job, resolved)
+        args = worker_launcher.build_worker_args(job, cfg, resolved)
         # The worker runs as a background asyncio task; job state is mutated live
         # by worker_launcher (same event loop) and mirrored to disk on every change.
-        run_timeout_ms = int((timeout_s or limits["timeout_s"]) * 1000)
+        run_timeout_ms = int((timeout_s or cfg.timeout_s) * 1000)
         task = asyncio.create_task(run_worker(cfg, job, args, run_timeout_ms))
         runtime.setdefault(job["taskId"], {})["task"] = task
     except Exception as e:  # noqa: BLE001 - never leave a worktree/branch orphaned
@@ -213,7 +214,7 @@ async def dispatch_task(
         {
             "task_id": wt["taskId"], "status": "running",
             "branch": wt["branch"], "worktree": wt["worktree"],
-            "model": resolved["model"], "profile": resolved["name"], "mode": mode,
+            "model": resolved["model"], "mode": mode,
             "warnings": warnings,
             **preflight_extra,
         }
@@ -555,12 +556,11 @@ async def review_task(task_id: str, verdict: str, feedback: str | None = None) -
     statusline_render.write_statusline(j)
     events.publish(j["repo"], task_id, {"kind": "retry", "attempt": j["attempt"], "feedback": feedback[:300]})
 
-    try:
-        resolved = store.resolve_profile(j.get("profile"))
-    except KeyError as e:
-        return json.dumps({"error": str(e)})
-    args = worker_launcher.build_worker_args(j, resolved)
-    run_timeout_ms = int((j.get("timeoutS") or resolved["limits"]["timeout_s"]) * 1000)
+    resolved = config.required_config()
+    if resolved["errors"]:
+        return json.dumps({"error": "; ".join(resolved["errors"])})
+    args = worker_launcher.build_worker_args(j, cfg, resolved)
+    run_timeout_ms = int((j.get("timeoutS") or cfg.timeout_s) * 1000)
     # A stale runtime entry (cancelled=True, an old proc handle) from the
     # attempt just rejected would otherwise survive into the retry and make
     # it finalize as cancelled the moment it produces output.
@@ -675,189 +675,67 @@ async def batch(
     return json.dumps({"error": f"unknown action {action!r}"})
 
 
-# ── Configuration facade (§6.13) ─────────────────────────────────────────
-# Sovereignty rule (I9): the supervisor must only call configure's mutating
-# actions when the user explicitly asked for a configuration change —
-# enforced by the packaged skill and restated in the tool description below,
-# since a skill rule alone is easy for a model to drift past under pressure.
+# ── Configuration facade (§6.13, env-config-spec.md) ────────────────────
+# There is nothing left to mutate here: every user-set value lives in an
+# environment variable (config.py), read fresh on every call. `configure`
+# is read-only except add_note/prune, which are repo housekeeping, not
+# configuration.
 
-from pydantic import BaseModel  # noqa: E402 - transitive dependency of mcp
-
-
-class _ApiKeyInput(BaseModel):
-    api_key: str
-
-
-def _parse_json_arg(raw: str | None, label: str) -> tuple[dict[str, Any] | None, str | None]:
-    if not raw:
-        return {}, None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        return None, f"invalid {label}: {e}"
-    if not isinstance(parsed, dict):
-        return None, f"{label} must be a JSON object"
-    return parsed, None
+_LIMIT_FIELDS = (
+    "preflight_timeout_s", "verify_timeout_s", "wait_timeout_s", "wait_hard_cap_s",
+    "max_diff_lines", "integrate_mode", "probe_ttl_s", "conventions_max_chars",
+    "notes_max_chars", "max_budget_usd", "max_tokens_total", "timeout_s", "stall_s",
+    "command_timeout_s", "ask_timeout_s", "recursion_limit_micro", "recursion_limit_task",
+    "rubric_max_iterations_task",
+)
 
 
-async def _configure_store_key(profile: str, key: str | None) -> str:
-    cfg_store = store.load_store()
-    prof = cfg_store["profiles"].get(profile)
-    if not prof:
-        return json.dumps({"error": f"unknown profile {profile!r}"})
-    env_var = prof.get("api_key_env_var")
-    if not env_var:
-        return json.dumps({"error": f"profile {profile!r} has no api_key_env_var"})
-
-    via = "parameter"
-    if key is None:
-        # Elicitation: the response returns straight to this server via the
-        # client UI — the model never sees the secret.
-        try:
-            ctx = mcp.get_context()
-            result = await ctx.elicit(
-                message=(
-                    f"Enter the API key to store for profile '{profile}' "
-                    f"(saved to {store.credentials_path()} as {env_var})."
-                ),
-                schema=_ApiKeyInput,
-            )
-            if getattr(result, "action", None) != "accept":
-                return json.dumps({"cancelled": True, "profile": profile})
-            key = result.data.api_key
-            via = "elicitation"
-        except Exception as e:  # noqa: BLE001 - client may not support elicitation
-            return json.dumps(
-                {
-                    "error": "elicitation unavailable on this client",
-                    "detail": str(e)[:200],
-                    "fallback": (
-                        f"Set the {env_var} environment variable before launching Claude Code, "
-                        f"or add {{\"{env_var}\": \"<key>\"}} to {store.credentials_path()}."
-                    ),
-                }
-            )
-    if not key or not isinstance(key, str):
-        return json.dumps({"error": "no key provided"})
-
-    store.store_credential(env_var, key)
-    # Other profiles can share this env var, so clear every cached probe
-    # rather than guessing which ones are affected.
-    backend.invalidate_probe()
-    note = None
-    if via == "parameter":
-        note = "key transited the model conversation; consider rotating it and re-entering via elicitation"
-    return json.dumps({"profile": profile, "stored_as": env_var, "via": via, "note": note})
+def _probe_profile(resolved: dict[str, Any]) -> dict[str, Any]:
+    return {"name": "default", "model": resolved["model"], "api_base": resolved["base_url"], "api_key": resolved["api_key"]}
 
 
 @mcp.tool(
     description=(
-        "Only call mutating actions when the user explicitly asked for a configuration change. "
-        "Manages worker profiles, defaults, API keys, and diagnostics: status, set_profile, "
-        "remove_profile, set_default, set_defaults, store_key, discover_models, probe, doctor, "
-        "add_note, prune. action selects the operation; other args vary per action."
+        "Read-only environment and health checks; add_note/prune only on explicit request. "
+        "status reports every MONKEY_* variable's resolved value or default (the API key shown "
+        "only as set/not set, never its value) plus any validation errors. doctor runs a full "
+        "health sweep. probe/discover_models check the configured endpoint directly."
     )
 )
 async def configure(
     action: str,
-    name: str | None = None,
-    model: str | None = None,
-    api_base: str | None = None,
-    api_key_env_var: str | None = None,
-    fallback_models: list[str] | None = None,
-    price_input_per_mtok: float | None = None,
-    price_output_per_mtok: float | None = None,
-    model_kwargs_json: str = "",
-    limits_json: str = "",
-    profile: str | None = None,
-    key: str | None = None,
     repo_path: str | None = None,
     text: str | None = None,
     older_than_days: int | None = None,
-    defaults_json: str = "",
 ) -> str:
     cfg = _cfg()
     if action == "status":
-        cfg_store = store.load_store()
-        profiles = {
-            n: {**prof, "auth": store.auth_state(prof)}
-            for n, prof in cfg_store["profiles"].items()
-        }
+        resolved = config.required_config()
         return json.dumps({
-            "config_path": str(store.config_path()),
-            "default_profile": cfg_store["default_profile"],
-            "profiles": profiles,
-            "defaults": store.get_defaults(),
+            "home": str(config.home_dir()),
+            "base_url": resolved.get("base_url"),
+            "api_key_set": bool(resolved.get("api_key")),
+            "model": resolved.get("model"),
+            "fallback_models": resolved.get("fallback_models"),
+            "prices": resolved.get("prices"),
+            "model_kwargs": resolved.get("model_kwargs"),
+            "limits": {field: getattr(cfg, field) for field in _LIMIT_FIELDS},
+            "errors": resolved.get("errors", []),
             "last_probes": backend.all_last_probes(),
-            "last_doctor_at": cfg_store.get("meta", {}).get("last_doctor_at"),
+            "last_doctor_at": store.last_doctor_at(),
         })
 
-    if action == "set_profile":
-        if not name or not model:
-            return json.dumps({"error": "set_profile requires name and model"})
-        model_kwargs, err = _parse_json_arg(model_kwargs_json, "model_kwargs_json")
-        if err:
-            return json.dumps({"error": err})
-        limits, err = _parse_json_arg(limits_json, "limits_json")
-        if err:
-            return json.dumps({"error": err})
-        prices = {}
-        if price_input_per_mtok is not None:
-            prices["input"] = price_input_per_mtok
-        if price_output_per_mtok is not None:
-            prices["output"] = price_output_per_mtok
-        try:
-            prof = store.set_profile(
-                name, model, api_key_env_var, api_base, fallback_models,
-                prices or None, model_kwargs or None, limits or None,
-            )
-        except ValueError as e:
-            return json.dumps({"error": str(e)})
-        backend.invalidate_probe(name)
-        return json.dumps({"profile": name, "saved": True, **prof})
-
-    if action == "remove_profile":
-        if not name:
-            return json.dumps({"error": "remove_profile requires name"})
-        if not store.remove_profile(name):
-            return json.dumps({"error": f"unknown profile {name!r}"})
-        backend.invalidate_probe(name)
-        return json.dumps({"profile": name, "removed": True})
-
-    if action == "set_default":
-        if not name:
-            return json.dumps({"error": "set_default requires name"})
-        try:
-            store.set_default_profile(name)
-        except KeyError:
-            return json.dumps({"error": f"unknown profile {name!r}"})
-        backend.invalidate_probe(name)
-        return json.dumps({"default_profile": name})
-
-    if action == "set_defaults":
-        patch, err = _parse_json_arg(defaults_json, "defaults_json")
-        if err:
-            return json.dumps({"error": err})
-        return json.dumps({"defaults": store.set_defaults(patch or {})})
-
-    if action == "store_key":
-        if not profile:
-            return json.dumps({"error": "store_key requires profile"})
-        return await _configure_store_key(profile, key)
-
     if action == "discover_models":
-        try:
-            resolved = store.resolve_profile(profile)
-        except KeyError as e:
-            return json.dumps({"error": str(e)})
-        return json.dumps(await _offload(backend.discover_models, resolved))
+        resolved = config.required_config()
+        if resolved["errors"]:
+            return json.dumps({"error": "; ".join(resolved["errors"])})
+        return json.dumps(await _offload(backend.discover_models, _probe_profile(resolved)))
 
     if action == "probe":
-        try:
-            resolved = store.resolve_profile(profile)
-        except KeyError as e:
-            return json.dumps({"error": str(e)})
-        return json.dumps(await _offload(backend.probe, resolved, ttl_s=cfg.probe_ttl_s))
+        resolved = config.required_config()
+        if resolved["errors"]:
+            return json.dumps({"error": "; ".join(resolved["errors"])})
+        return json.dumps(await _offload(backend.probe, _probe_profile(resolved), ttl_s=cfg.probe_ttl_s))
 
     if action == "doctor":
         checks = await _offload(backend.doctor, repo_path)

@@ -9,7 +9,6 @@ assertion, same technique test_launcher_env.py uses for worker.py."""
 from __future__ import annotations
 
 import ast
-import json
 import os
 import re
 import sys
@@ -27,24 +26,25 @@ MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
 
 
 class TestLoadDefaultsLiveReload(unittest.TestCase):
+    """env-config-spec.md: config.json is gone — the env var itself is the
+    only source, so a value changed between calls (configure(status) reads
+    live) must be picked up without any caching."""
+
     def setUp(self):
         self._home = tempfile.TemporaryDirectory()
         os.environ["MONKEY_ARMY_HOME"] = self._home.name
-        self._config_path = Path(self._home.name) / "config.json"
 
     def tearDown(self):
         os.environ.pop("MONKEY_ARMY_HOME", None)
+        os.environ.pop("MONKEY_MAX_DIFF_LINES", None)
         self._home.cleanup()
 
-    def _write_max_diff_lines(self, value: int) -> None:
-        self._config_path.write_text(json.dumps({"defaults": {"max_diff_lines": value}}), encoding="utf-8")
-
     def test_second_call_sees_a_value_changed_between_calls(self):
-        self._write_max_diff_lines(111)
+        os.environ["MONKEY_MAX_DIFF_LINES"] = "111"
         first = load_defaults()
         self.assertEqual(first.max_diff_lines, 111)
 
-        self._write_max_diff_lines(222)
+        os.environ["MONKEY_MAX_DIFF_LINES"] = "222"
         second = load_defaults()
         self.assertEqual(second.max_diff_lines, 222)
 

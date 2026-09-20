@@ -204,34 +204,35 @@ def build_brief(
     return brief_path
 
 
-def build_worker_args(job: dict[str, Any], resolved: dict[str, Any]) -> dict[str, Any]:
+def build_worker_args(job: dict[str, Any], cfg: Defaults, resolved: dict[str, Any]) -> dict[str, Any]:
     """The `args` dict `run_worker`/`retry` need, built from a job's own
-    persisted fields plus a freshly `store.resolve_profile`d profile.
+    persisted fields plus a freshly `config.required_config()`d env config.
 
     Shared by dispatch_task (first attempt) and review_task's reject path
     (retry): re-resolving fresh — rather than keeping the launch args around
     on the job — means a retry works even across a server restart, and never
-    needs to persist secrets on the job.
+    needs to persist secrets on the job. Limits come straight from `cfg`
+    (env-only, §env-config-spec.md) — there is no per-profile override to
+    merge anymore.
     """
-    limits = resolved["limits"]
     mode = job.get("mode", "micro")
-    recursion_default = limits["recursion_limit_micro"] if mode == "micro" else limits["recursion_limit_task"]
-    prices = resolved.get("price_per_mtok") or {}
+    recursion_default = cfg.recursion_limit_micro if mode == "micro" else cfg.recursion_limit_task
+    prices = resolved.get("prices") or {}
     return {
         "title": job.get("title"), "spec": job.get("spec"), "worktree": job["worktree"],
         "test_command": job.get("testCommand"), "definition_of_done": job.get("definitionOfDone"),
         "allowed_files": job.get("allowedFiles") or [], "context_files": job.get("contextFiles") or [],
-        "mode": mode, "model": resolved["model"], "api_base": resolved.get("api_base"),
-        "api_key_env_var": resolved.get("api_key_env_var"), "api_key": resolved.get("api_key"),
+        "mode": mode, "model": resolved["model"], "api_base": resolved.get("base_url"),
+        "api_key_env_var": "MONKEY_9ROUTER_KEY", "api_key": resolved.get("api_key"),
         "fallback_models": resolved.get("fallback_models") or [],
         "model_kwargs": resolved.get("model_kwargs") or {},
         "price_in": prices.get("input"), "price_out": prices.get("output"),
-        "max_budget_usd": job.get("maxBudgetUsd") or limits["max_budget_usd"],
-        "max_tokens_total": job.get("maxTokensTotal") or limits["max_tokens_total"],
+        "max_budget_usd": job.get("maxBudgetUsd") or cfg.max_budget_usd,
+        "max_tokens_total": job.get("maxTokensTotal") or cfg.max_tokens_total,
         "recursion_limit": recursion_default,
-        "rubric_max_iterations": limits["rubric_max_iterations_task"],
-        "command_timeout": limits["command_timeout_s"],
-        "ask_timeout_s": limits["ask_timeout_s"],
+        "rubric_max_iterations": cfg.rubric_max_iterations_task,
+        "command_timeout": cfg.command_timeout_s,
+        "ask_timeout_s": cfg.ask_timeout_s,
     }
 
 
