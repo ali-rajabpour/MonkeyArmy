@@ -26,7 +26,7 @@ and reviewed and merged back by the supervisor — never idle tokens spent on ty
    claude plugin marketplace add ali-rajabpour/MonkeyArmy   # or a local path to this repo
    claude plugin install monkey-army@monkey-army
    ```
-4. Run `/monkey-setup` (or say "monkeys: set up") — no restart, no env vars, no file editing;
+4. Run `/monkey-army:setup` (or say "monkeys: set up") — no restart, no env vars, no file editing;
    the key is entered in a secure dialog.
 5. Try it on a scratch repo: `/monkey-army add a subtract(a, b) function to calc/__init__.py...`.
 
@@ -37,20 +37,20 @@ Installed plugins load in every conversation, so you can reach for the monkeys a
 - `/monkey-army <task>` — start the delegation loop explicitly.
 - "use monkey army for this task", "delegate this to the monkeys" — mid-conversation, in plain
   language; the supervisor loads the skill itself.
-- "should we delegate this?" — the lighter `monkey-assess` skill answers DELEGATE / DO IT
+- "should we delegate this?" — the lighter `assess` skill answers DELEGATE / DO IT
   YOURSELF / BORDERLINE without dispatching anything.
-- `/monkey-setup` — first-run configuration (URL, profile, key, combo, probe).
-- `/monkey-status` — what is configured now, and is it healthy. Read-only.
-- `/monkey-repair` — fix one thing: model, URL, prices, fallback, key, default, or drop a profile.
-- `/monkey-reset` — delete every profile and stored key and start over (two-step; keeps your task
+- `/monkey-army:setup` — first-run configuration (URL, profile, key, combo, probe).
+- `/monkey-army:status` — what is configured now, and is it healthy. Read-only.
+- `/monkey-army:repair` — fix one thing: model, URL, prices, fallback, key, default, or drop a profile.
+- `/monkey-army:reset` — delete every profile and stored key and start over (two-step; keeps your task
   history, patches and notes).
 
-Commands are namespaced, so the full form is `/monkey-army:monkey-status` — type `/monkey` and the
+Commands are namespaced, so the full form is `/monkey-army:status` — type `/monkey` and the
 menu will show them.
 
 Full walkthrough: [`docs/SETUP.md`](docs/SETUP.md).
 
-Got something wrong? `/monkey-setup` also fixes it: re-run it to overwrite a profile, or ask to
+Got something wrong? `/monkey-army:setup` also fixes it: re-run it to overwrite a profile, or ask to
 remove a profile, change the default, re-enter the key, or reset the configuration completely
 (`configure(action="reset")`, two-step, keeps your task history).
 

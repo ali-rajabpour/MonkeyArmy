@@ -1,6 +1,6 @@
 ---
-name: monkey-setup
-description: Guided setup and repair of the monkeys MCP server — 9Router URL, profile, API key (secure dialog, or typed in chat if the dialog is unavailable), combo selection, probe. Also fixes a configuration afterwards: edit or remove a profile, change the default, re-enter the key, or reset everything and start over. Triggered by "monkeys: set up", "set up monkey army", "configure the monkeys", "reset the monkey setup", "remove the monkey profile", or /monkey-setup. Not for running a delegation batch (use /monkey-army).
+name: setup
+description: Guided setup and repair of the monkeys MCP server — 9Router URL, profile, API key (secure dialog, or typed in chat if the dialog is unavailable), combo selection, probe. Also fixes a configuration afterwards: edit or remove a profile, change the default, re-enter the key, or reset everything and start over. Triggered by "monkeys: set up", "set up monkey army", "configure the monkeys", "reset the monkey setup", "remove the monkey profile", or /monkey-army:setup. Not for running a delegation batch (use /monkey-army).
 ---
 
 # Monkey Setup — guided first-run configuration

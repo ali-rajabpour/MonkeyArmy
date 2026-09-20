@@ -12,4 +12,4 @@ Report the monkeys' current state. Change nothing.
 3. If `$ARGUMENTS` names a repo path, add `configure(action="doctor", repo_path=<path>)`.
 
 Present it as a short table: profile, model, api_base, key set, default?, last probe. Never
-print a key or any part of one. If no profile exists, say so and point at `/monkey-setup`.
+print a key or any part of one. If no profile exists, say so and point at `/monkey-army:setup`.

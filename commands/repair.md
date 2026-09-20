@@ -4,7 +4,7 @@ argument-hint: "[what is wrong, e.g. 'wrong model' or 'remove profile coder']"
 ---
 
 Repair an existing configuration. Use the smallest action that fixes what the user names; never
-reset unless they ask to start over (that is `/monkey-reset`).
+reset unless they ask to start over (that is `/monkey-army:reset`).
 
 1. `configure(action="status")` first — know what exists before changing it.
 2. Then, matching `$ARGUMENTS` (ask which, if it is ambiguous):

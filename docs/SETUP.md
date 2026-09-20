@@ -39,7 +39,7 @@ available in every conversation, with no `--plugin-dir` flag and no per-project 
 Run `/mcp` — you should see the `monkeys` server with 13 tools.
 
 ## 4. Configure by talking (no restart, no env vars)
-Run `/monkey-setup` (saying "monkeys: set up" also triggers it). The supervisor will:
+Run `/monkey-army:setup` (saying "monkeys: set up" also triggers it). The supervisor will:
 1. run `doctor` (checks uv, git, worker dependencies, 9Router reachability),
 2. ask for your 9Router URL,
 3. ask for the API key through a secure dialog (it never appears in the chat); if your
@@ -121,12 +121,12 @@ Four commands cover the whole lifecycle (full form `/monkey-army:<name>`; typing
 
 | Command | Use it for |
 |---|---|
-| `/monkey-setup` | first-run configuration |
-| `/monkey-status` | what is configured, and is it healthy (read-only) |
-| `/monkey-repair` | change one thing — model, URL, prices, fallback, key, default, or remove a profile |
-| `/monkey-reset` | delete every profile and stored key, then start over |
+| `/monkey-army:setup` | first-run configuration |
+| `/monkey-army:status` | what is configured, and is it healthy (read-only) |
+| `/monkey-army:repair` | change one thing — model, URL, prices, fallback, key, default, or remove a profile |
+| `/monkey-army:reset` | delete every profile and stored key, then start over |
 
-`/monkey-repair` maps your request to the smallest change:
+`/monkey-army:repair` maps your request to the smallest change:
 
 - a wrong URL, model, price or fallback → the profile is overwritten in place, key untouched;
 - a wrong key → the dialog opens again and replaces it;

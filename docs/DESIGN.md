@@ -325,6 +325,12 @@ with deepagents 0.7.0a6.
   another plain `<id>` (verified live). The wizard offers `models` when `combos` is empty and
   uses the id verbatim after the provider prefix.
 
+2026-09-20 (command names):
+- Skills and commands are named without the `monkey-` prefix — the plugin namespace already
+  supplies it, so `/monkey-army:setup` beats `/monkey-army:monkey-setup`. The flagship skill
+  keeps the name `monkey-army` (that is the name people type and say); everything else is
+  `setup`, `assess`, `status`, `repair`, `reset`.
+
 ## VERIFY table (plan §14)
 
 | Claim | Outcome | Evidence / fallback taken |
@@ -335,7 +341,7 @@ with deepagents 0.7.0a6.
 | `SubAgent` dict accepts a model instance under `"model"` | TRUE | `SubAgent.__annotations__["model"]` is `NotRequired[str \| BaseChatModel]`. |
 | `git apply --check --3way` accepted together | ACCEPTED BUT UNUSABLE | The pair exits 0 on a patch that conflicts, and the real `--3way` apply leaves `UU` markers. Fallback taken: strict `git apply --index --check` / `git apply --index`. |
 | Claude Code MCP per-call tool timeout env var name/default | PARTIALLY VERIFIED | Claude Code 2.1.278 has `MCP_TOOL_TIMEOUT` (ms) plus a per-server `timeout` field that overrides it ("values below 1000ms are ignored"); also `MCP_TIMEOUT`, `MCP_TOOL_IDLE_TIMEOUT`, `MCP_CONNECT_TIMEOUT_MS`. The numeric default is a minified constant and was not extracted, so the docs point at the version's own documentation. `wait_for_tasks` caps itself at 170 s regardless. |
-| Claude Code honours `disable-model-invocation: true` in plugin skills | NOT VERIFIED | Kept on `monkey-army` as the plan specifies; harmless if ignored. `monkey-setup` deliberately omits it so plain text can reach the setup flow. |
+| Claude Code honours `disable-model-invocation: true` in plugin skills | NOT VERIFIED | Kept on `monkey-army` as the plan specifies; harmless if ignored. `setup` deliberately omits it so plain text can reach the setup flow. |
 | 9Router `/v1/models` lists combos as `combo/<id>` | FALSE on at least one deployment | A live router listed combos unprefixed (`coder`, `coder-fast`, `daily`), so `combos` came back empty and `openai/combo/coder` failed with `No active credentials for provider: combo`. Fallback taken: treat `combos` as a hint, offer `models`, use the id verbatim (`openai/coder`). |
 
 ## §6 tool count note

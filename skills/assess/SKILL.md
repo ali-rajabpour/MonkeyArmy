@@ -1,5 +1,5 @@
 ---
-name: monkey-assess
+name: assess
 description: When the user asks for implementation work that spans several files or is mostly mechanical typing, quickly judge whether it should be delegated to cheap workers with /monkey-army instead of being typed by this expensive model. Advice only; never dispatches.
 ---
 
