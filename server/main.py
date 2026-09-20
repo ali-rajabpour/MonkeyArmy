@@ -34,7 +34,7 @@ import store
 import statusline_render
 import verify as verify_mod
 import worker_launcher
-from config import load_defaults
+from config import Defaults, load_defaults
 from jobs import (
     changed_files,
     cleanup_job,
@@ -49,7 +49,14 @@ from persistence import ACTIVE as ACTIVE_STATES, REVIEWABLE, TERMINAL as TERMINA
 from proc_utils import kill_tree
 from worker_launcher import comm_dir_for, run_worker
 
-cfg = load_defaults()
+def _cfg() -> Defaults:
+    """Reload config.json's `defaults` section on every call, so
+    configure(action='set_defaults') takes effect on the next tool call —
+    no restart needed. A module-level `cfg = load_defaults()` here would
+    freeze these values at import time (§ review-fix B)."""
+    return load_defaults()
+
+
 mcp = FastMCP("monkey-army")
 
 
@@ -93,6 +100,7 @@ async def dispatch_task(
     max_tokens_total: int | None = None,
     timeout_s: int | None = None,
 ) -> str:
+    cfg = _cfg()
     # Resolve model/key per task from the config store (facade profiles).
     # Read fresh each call so facade changes apply without a server restart.
     try:
@@ -114,6 +122,11 @@ async def dispatch_task(
     warnings: list[str] = []
     if not allowed_files:
         warnings.append("allowed_files is empty/unrestricted — scope enforcement will not apply to this task")
+    if probe_result.get("tool_calling") == "not_observed":
+        warnings.append(
+            "probe did not observe a tool call from this model — deepagents relies on tool "
+            "calling; verify the combo before trusting results"
+        )
 
     wt = await _offload(create_worktree, repo_path, base_branch)
     job: dict[str, Any] = {
@@ -196,6 +209,7 @@ async def dispatch_task(
     )
 )
 async def task_status(task_id: str) -> str:
+    cfg = _cfg()
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
@@ -228,6 +242,7 @@ async def task_status(task_id: str) -> str:
     )
 )
 async def task_progress(task_id: str, activity_limit: int = 8) -> str:
+    cfg = _cfg()
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
@@ -270,6 +285,7 @@ async def task_progress(task_id: str, activity_limit: int = 8) -> str:
     )
 )
 async def task_result(task_id: str, include_patch: bool = True) -> str:
+    cfg = _cfg()
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
@@ -317,6 +333,7 @@ async def task_result(task_id: str, include_patch: bool = True) -> str:
     )
 )
 async def cancel_task(task_id: str) -> str:
+    cfg = _cfg()
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
@@ -379,6 +396,7 @@ async def cancel_task(task_id: str) -> str:
     )
 )
 async def steer_task(task_id: str, message: str) -> str:
+    cfg = _cfg()
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
@@ -414,6 +432,7 @@ async def steer_task(task_id: str, message: str) -> str:
     )
 )
 async def answer_worker(task_id: str, answer: str) -> str:
+    cfg = _cfg()
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
@@ -459,6 +478,7 @@ async def answer_worker(task_id: str, answer: str) -> str:
     )
 )
 async def cleanup_task(task_id: str, delete_branch: bool | None = None) -> str:
+    cfg = _cfg()
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
@@ -480,6 +500,7 @@ async def cleanup_task(task_id: str, delete_branch: bool | None = None) -> str:
     )
 )
 async def review_task(task_id: str, verdict: str, feedback: str | None = None) -> str:
+    cfg = _cfg()
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
@@ -540,6 +561,7 @@ async def review_task(task_id: str, verdict: str, feedback: str | None = None) -
     )
 )
 async def wait_for_tasks(task_ids: list[str], timeout_s: int | None = None) -> str:
+    cfg = _cfg()
     result = await jobs_wait_for_tasks(task_ids, timeout_s, cfg.wait_timeout_s, cfg.wait_hard_cap_s)
     return json.dumps(result)
 
@@ -556,6 +578,7 @@ async def integrate_task(
     task_id: str, message: str | None = None, mode: str | None = None,
     allow_branch_mismatch: bool = False,
 ) -> str:
+    cfg = _cfg()
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
@@ -586,6 +609,7 @@ async def batch(
     goal: str | None = None, tasks_json: str = "",
     verify_command: str | None = None, mode: str | None = None,
 ) -> str:
+    cfg = _cfg()
     if action == "create":
         if not repo_path or not goal or not tasks_json:
             return json.dumps({"error": "create requires repo_path, goal, tasks_json"})
@@ -685,6 +709,9 @@ async def _configure_store_key(profile: str, key: str | None) -> str:
         return json.dumps({"error": "no key provided"})
 
     store.store_credential(env_var, key)
+    # Other profiles can share this env var, so clear every cached probe
+    # rather than guessing which ones are affected.
+    backend.invalidate_probe()
     note = None
     if via == "parameter":
         note = "key transited the model conversation; consider rotating it and re-entering via elicitation"
@@ -717,6 +744,7 @@ async def configure(
     older_than_days: int | None = None,
     defaults_json: str = "",
 ) -> str:
+    cfg = _cfg()
     if action == "status":
         cfg_store = store.load_store()
         profiles = {
@@ -752,6 +780,7 @@ async def configure(
             )
         except ValueError as e:
             return json.dumps({"error": str(e)})
+        backend.invalidate_probe(name)
         return json.dumps({"profile": name, "saved": True, **prof})
 
     if action == "remove_profile":
@@ -759,6 +788,7 @@ async def configure(
             return json.dumps({"error": "remove_profile requires name"})
         if not store.remove_profile(name):
             return json.dumps({"error": f"unknown profile {name!r}"})
+        backend.invalidate_probe(name)
         return json.dumps({"profile": name, "removed": True})
 
     if action == "set_default":
@@ -768,6 +798,7 @@ async def configure(
             store.set_default_profile(name)
         except KeyError:
             return json.dumps({"error": f"unknown profile {name!r}"})
+        backend.invalidate_probe(name)
         return json.dumps({"default_profile": name})
 
     if action == "set_defaults":

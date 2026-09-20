@@ -141,6 +141,35 @@ class TestProbe(unittest.TestCase):
         self.assertTrue(cached["ok"])
 
 
+class TestInvalidateProbe(unittest.TestCase):
+    def test_named_invalidate_drops_only_that_profile(self):
+        handler = _handler(chat_response={"choices": [{"message": {}}]})
+        with _StubServer(handler) as base:
+            backend.probe(_profile(base, name="inv-a"), ttl_s=600)
+            backend.probe(_profile(base, name="inv-b"), ttl_s=600)
+        self.assertIsNotNone(backend.last_probe("inv-a"))
+        self.assertIsNotNone(backend.last_probe("inv-b"))
+
+        backend.invalidate_probe("inv-a")
+
+        self.assertIsNone(backend.last_probe("inv-a"))
+        self.assertIsNotNone(backend.last_probe("inv-b"))
+
+    def test_invalidate_with_no_name_clears_everything(self):
+        handler = _handler(chat_response={"choices": [{"message": {}}]})
+        with _StubServer(handler) as base:
+            backend.probe(_profile(base, name="inv-c"), ttl_s=600)
+            backend.probe(_profile(base, name="inv-d"), ttl_s=600)
+
+        backend.invalidate_probe()
+
+        self.assertIsNone(backend.last_probe("inv-c"))
+        self.assertIsNone(backend.last_probe("inv-d"))
+
+    def test_invalidate_unknown_profile_is_a_noop(self):
+        backend.invalidate_probe("never-probed")  # must not raise
+
+
 class TestBareModelForHttp(unittest.TestCase):
     def test_strips_provider_prefix(self):
         self.assertEqual(backend._bare_model_for_http("openai/combo/deepseek-main"), "combo/deepseek-main")

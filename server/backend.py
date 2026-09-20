@@ -126,6 +126,16 @@ def probe(profile: dict[str, Any], ttl_s: int = 600, timeout_s: float = 30) -> d
     return result
 
 
+def invalidate_probe(profile_name: str | None = None) -> None:
+    """Drop a cached probe verdict so the next dispatch_task re-probes
+    instead of trusting a result from before a profile edit (model/api_base/
+    key change, removal, or a new default). None clears every entry."""
+    if profile_name is None:
+        _PROBE_CACHE.clear()
+    else:
+        _PROBE_CACHE.pop(profile_name, None)
+
+
 def last_probe(profile_name: str) -> dict[str, Any] | None:
     cached = _PROBE_CACHE.get(profile_name)
     if not cached:
