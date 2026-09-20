@@ -285,5 +285,37 @@ class TestResetConfig(unittest.TestCase):
         self.assertTrue((repo_state / "keep.txt").exists())
 
 
+class TestCredentialWithoutProfile(unittest.TestCase):
+    """The setup wizard stores the key BEFORE any profile exists (credentials
+    are keyed by env var name), so a half-finished run leaves no broken
+    profile behind."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"MONKEY_ARMY_HOME": self.tmp.name})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_key_stored_then_picked_up_by_a_later_profile(self):
+        store.store_credential("MONKEY_9ROUTER_KEY", "sk-from-wizard")
+        self.assertEqual(store.load_store()["profiles"], {})  # nothing written yet
+
+        store.set_profile(
+            "deepseek-combo", "openai/combo/real",
+            api_key_env_var="MONKEY_9ROUTER_KEY", api_base="http://127.0.0.1:1/v1",
+        )
+        resolved = store.resolve_profile("deepseek-combo")
+        self.assertEqual(resolved["api_key"], "sk-from-wizard")
+        self.assertEqual(resolved["model"], "openai/combo/real")
+
+    def test_credentials_file_is_0600(self):
+        store.store_credential("MONKEY_9ROUTER_KEY", "sk-from-wizard")
+        mode = stat.S_IMODE(store.credentials_path().stat().st_mode)
+        self.assertEqual(mode, 0o600)
+
+
 if __name__ == "__main__":
     unittest.main()

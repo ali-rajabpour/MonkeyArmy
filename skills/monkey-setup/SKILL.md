@@ -20,27 +20,20 @@ reachability. Fix anything it flags (report it, don't silently continue) before 
 ## 2. 9Router URL
 Ask the user for their 9Router URL. Default if they have none ready: `http://localhost:20128/v1`.
 
-## 3. Profile name
-Ask what to call the profile. Default: `deepseek-combo`.
+## 3. Store the key
+```
+configure(action="store_key", api_key_env_var="MONKEY_9ROUTER_KEY")
+```
+No profile exists yet — that is deliberate, and this call does not need one (credentials are
+keyed by the env var name).
 
-## 4. Create the profile (placeholder model)
-```
-configure(action="set_profile", name=<profile>, model="openai/combo/<placeholder>",
-          api_base=<url>, api_key_env_var="MONKEY_9ROUTER_KEY")
-```
-This is provisional — the model id is filled in for real at step 6.
-
-## 5. Store the key
-```
-configure(action="store_key", profile=<profile>)
-```
 Call it **without** a `key` argument first — that opens a secure dialog and the key never enters
 the chat. This is the path to prefer, always.
 
 If the dialog is unavailable (the client does not support elicitation, and the tool says so) or
 the user asks to enter the key directly, take it in the conversation and store it:
 ```
-configure(action="store_key", profile=<profile>, key="<key the user gave>")
+configure(action="store_key", api_key_env_var="MONKEY_9ROUTER_KEY", key="<key the user gave>")
 ```
 Then say plainly, once: the key passed through the model conversation and is written to this
 session's transcript on disk, so rotate it in the 9Router dashboard when convenient and re-enter
@@ -51,29 +44,38 @@ dialog first and let them choose.
 The key is saved to `~/.monkey-army/credentials.json` (mode 0600) either way. The user never
 edits a file and never sets an environment variable.
 
-## 6. Discover combos
+## 4. Discover combos
 ```
-configure(action="discover_models", profile=<profile>)
+configure(action="discover_models", api_base=<url>, api_key_env_var="MONKEY_9ROUTER_KEY")
 ```
-Present the returned combos and ask the user which one to use. Optionally also ask for
-input/output prices per Mtok and a fallback model.
+Again, no profile needed. Present the returned combos and ask the user which one to use.
 
-## 7. Finalize the profile
+If this fails, the URL or the key is wrong — fix that here, before anything is written to the
+config. That is the whole point of doing it at this stage.
+
+## 5. Ask for the rest
+- Profile name. Default: `deepseek-combo`.
+- Optionally: input/output prices per Mtok, and a fallback model.
+
+## 6. Create the profile — once, complete
 ```
 configure(action="set_profile", name=<profile>, model="openai/combo/<chosen>", api_base=<url>,
           api_key_env_var="MONKEY_9ROUTER_KEY", fallback_models=[...]?,
           price_input_per_mtok=<?>, price_output_per_mtok=<?>)
 ```
+There is no placeholder step: the profile is written once, with the real model. If the user
+abandons the wizard before this point, nothing half-configured is left behind — at worst a key
+sits in `credentials.json`, which the next run reuses.
 
-## 8. Set as default
+## 7. Set as default
 `configure(action="set_default", name=<profile>)`
 
-## 9. Probe
+## 8. Probe
 `configure(action="probe", profile=<profile>)`
 
 Report the result: `ok`, `latency_ms`, `tool_calling`, `usage_present`. If `tool_calling` is
 `"not_observed"`, warn the user plainly — deepagents needs tool calling to work at all — and
-suggest they pick a different combo and repeat from step 6.
+suggest they pick a different combo and repeat from step 4.
 
 Remind the user once: in 9Router, turn **off** RTK/Caveman tool-result compression for this key.
 Compressed tool results corrupt what the worker sees.

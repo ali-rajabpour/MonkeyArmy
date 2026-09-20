@@ -306,6 +306,14 @@ with deepagents 0.7.0a6.
   configuration is not the same as discarding work in flight. Editing one field stays a plain
   `set_profile` with the same name, so reset is never the first tool reached for.
 
+2026-09-20 (wizard order):
+- The setup wizard collects the URL, stores the key and lists the combos BEFORE writing a
+  profile, then writes it once with the real model. The earlier order created a placeholder
+  profile at step 4 and repaired it at step 7, so an interrupted run left a profile that looked
+  configured but always failed its probe with `model_not_found`. `store_key` and
+  `discover_models` therefore accept `api_key_env_var`/`api_base` with no profile — credentials
+  are keyed by env var name, not by profile, so nothing about that is a special case.
+
 ## VERIFY table (plan §14)
 
 | Claim | Outcome | Evidence / fallback taken |

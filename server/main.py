@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -700,14 +701,25 @@ def _parse_json_arg(raw: str | None, label: str) -> tuple[dict[str, Any] | None,
     return parsed, None
 
 
-async def _configure_store_key(profile: str, key: str | None) -> str:
-    cfg_store = store.load_store()
-    prof = cfg_store["profiles"].get(profile)
-    if not prof:
-        return json.dumps({"error": f"unknown profile {profile!r}"})
-    env_var = prof.get("api_key_env_var")
-    if not env_var:
-        return json.dumps({"error": f"profile {profile!r} has no api_key_env_var"})
+async def _configure_store_key(
+    profile: str | None, key: str | None, api_key_env_var: str | None = None
+) -> str:
+    # Credentials are keyed by env var name, not by profile, so a key can be
+    # stored before any profile exists — which lets the setup wizard collect
+    # the key and list the combos BEFORE writing a profile, instead of
+    # creating a placeholder one it has to repair later.
+    if profile:
+        cfg_store = store.load_store()
+        prof = cfg_store["profiles"].get(profile)
+        if not prof:
+            return json.dumps({"error": f"unknown profile {profile!r}"})
+        env_var = prof.get("api_key_env_var")
+        if not env_var:
+            return json.dumps({"error": f"profile {profile!r} has no api_key_env_var"})
+    else:
+        env_var = api_key_env_var
+        if not env_var:
+            return json.dumps({"error": "store_key requires profile or api_key_env_var"})
 
     via = "parameter"
     if key is None:
@@ -841,15 +853,24 @@ async def configure(
         return json.dumps({"defaults": store.set_defaults(patch or {})})
 
     if action == "store_key":
-        if not profile:
-            return json.dumps({"error": "store_key requires profile"})
-        return await _configure_store_key(profile, key)
+        if not profile and not api_key_env_var:
+            return json.dumps({"error": "store_key requires profile or api_key_env_var"})
+        return await _configure_store_key(profile, key, api_key_env_var)
 
     if action == "discover_models":
-        try:
-            resolved = store.resolve_profile(profile)
-        except KeyError as e:
-            return json.dumps({"error": str(e)})
+        # Either against a saved profile, or against a URL + key env var that
+        # has no profile yet (first-run wizard).
+        if profile or not api_base:
+            try:
+                resolved = store.resolve_profile(profile)
+            except KeyError as e:
+                return json.dumps({"error": str(e)})
+        else:
+            env_var = api_key_env_var or "MONKEY_9ROUTER_KEY"
+            resolved = {
+                "api_base": api_base,
+                "api_key": store.get_credential(env_var) or os.environ.get(env_var),
+            }
         return json.dumps(await _offload(backend.discover_models, resolved))
 
     if action == "probe":
