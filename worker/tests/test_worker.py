@@ -391,5 +391,71 @@ class TestHeartbeat(unittest.TestCase):
         self.assertEqual(m.model_kwargs["timeout"], 42)
 
 
+class TestCdAbsoluteGuard(unittest.TestCase):
+    """virtual_mode shows the worktree as `/`, so a model writes `cd / &&
+    pytest` — which in the shell runs pytest against the whole disk. Observed
+    live: 17s of real work, then 12 minutes of drive scanning."""
+
+    def _blocked(self, cmd):
+        return bool(worker._CD_ABSOLUTE_RE.search(cmd))
+
+    def test_blocks_cd_to_absolute_paths(self):
+        for cmd in [
+            "cd / && uv run pytest -q",
+            "cd /",
+            "cd /calc && ls",
+            "ls; cd /tmp",
+            "true && cd '/' && pytest",
+            "(cd / && pytest)",
+        ]:
+            self.assertTrue(self._blocked(cmd), cmd)
+
+    def test_allows_relative_cd_and_plain_commands(self):
+        for cmd in [
+            "cd calc && ls",
+            "cd ./tests && pytest -q",
+            "python -m pytest -q",
+            "ls /tmp",            # reading an absolute path is not a cd
+            "echo cd /",          # quoted text is not a cd
+        ]:
+            self.assertFalse(self._blocked(cmd), cmd)
+
+
+class TestKillTreeReachesOtherProcessGroups(unittest.TestCase):
+    """`uv run` puts its child in its own process group, so killpg on the
+    shell's group missed it; two dozen pytest processes kept scanning the disk
+    for up to 1h47m after their workers died."""
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups")
+    def test_grandchild_in_a_new_group_is_killed(self):
+        import subprocess
+        # parent shell -> python that re-parents itself into a NEW process group
+        child_code = (
+            "import os, time, sys; os.setpgid(0, 0); "
+            "print(os.getpid(), flush=True); time.sleep(60)"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             f"import subprocess, sys; p = subprocess.Popen([sys.executable, '-c', {child_code!r}], stdout=subprocess.PIPE, text=True); "
+             "print(p.stdout.readline().strip(), flush=True); p.wait()"],
+            stdout=subprocess.PIPE, text=True, start_new_session=True,
+        )
+        grandchild = int(proc.stdout.readline().strip())
+        self.assertNotEqual(os.getpgid(grandchild), os.getpgid(proc.pid))
+
+        worker.kill_tree(proc.pid)
+        proc.wait(timeout=10)
+        deadline = time.time() + 5
+        alive = True
+        while time.time() < deadline:
+            try:
+                os.kill(grandchild, 0)
+                time.sleep(0.1)
+            except ProcessLookupError:
+                alive = False
+                break
+        self.assertFalse(alive, "grandchild in another process group survived kill_tree")
+
+
 if __name__ == "__main__":
     unittest.main()

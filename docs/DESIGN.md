@@ -340,6 +340,20 @@ with deepagents 0.7.0a6.
   nothing for minutes, so slow was indistinguishable from hung. The heartbeat makes silence mean
   stuck again; the per-request timeout is the layer that can actually end a hung call.
 
+2026-09-21 (runaway processes):
+- `kill_tree` walks the whole descendant tree (one `ps` snapshot, taken before anything dies) and
+  kills every process and its group, instead of `killpg` on the root's group alone. `uv run`
+  starts its child in a process group of its own, so the old version killed the shell and left
+  `pytest` running: one live session accumulated two dozen processes scanning the whole disk,
+  some for 1h47m after their workers were dead. It still never signals the caller's own group.
+- Workers may not `cd` to an absolute path. `virtual_mode` shows the worktree to the model as
+  `/`, so it wrote `cd / && pytest`, which in the shell collects tests from the real filesystem
+  root. Observed live: the edit took 17 s, then the task scanned the disk until its 900 s wall
+  clock. That, not model latency, was every "slow task" in the earlier live runs.
+- The heartbeat names what is actually in flight (`running \`pytest …\` (90s)`) instead of
+  labelling every silence "waiting on model", which misreported the incident above for ten
+  minutes.
+
 ## VERIFY table (plan §14)
 
 | Claim | Outcome | Evidence / fallback taken |

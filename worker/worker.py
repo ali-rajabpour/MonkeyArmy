@@ -66,6 +66,14 @@ DEFAULT_MODEL_REQUEST_TIMEOUT = 600
 # a reason to leave the worktree — refuse outright and tell the model why.
 _DRIVE_SCAN_RE = re.compile(r"""\bfind\s+['"]?(?:/|[A-Za-z]:[/\\]?)['"]?(?:\s|$)""")
 
+# `virtual_mode` shows the model its worktree as `/` (file tools list
+# `/calc/__init__.py`), so it reasonably believes `/` is the repo root and
+# writes `cd / && pytest`. In the SHELL, `/` is the real filesystem root:
+# pytest then collects the whole disk. Observed live: the edit took 17s, the
+# task then spent 12 minutes scanning the drive and timed out. Any `cd` to an
+# absolute path leaves the worktree, so refuse it and say why.
+_CD_ABSOLUTE_RE = re.compile(r"""(?:^|[;&|(]\s*)cd\s+['"]?/""")
+
 
 # ── Git allowlist (tool-level enforcement) ──────────────────────────────────
 # The system prompt already tells the worker never to push/merge/rebase —
@@ -217,6 +225,12 @@ def git_command_allowed(command: str) -> tuple[bool, str]:
     return True, ""
 
 
+# The shell command in flight, if any. The heartbeat used to call every
+# silence "waiting on model" — during the `cd /` incident it reported that
+# for ten minutes while a shell command was scanning the disk.
+_CURRENT_COMMAND: list[str | None] = [None]
+
+
 class Heartbeat:
     """Emit a PROGRESS line every `interval` seconds while the agent is busy.
 
@@ -259,7 +273,9 @@ class Heartbeat:
             # 0.05s interval), which hid the whole mechanism under test.
             idle = time.time() - self._started_at
             if idle >= self._interval:
-                emit_progress({"kind": "waiting", "note": f"waiting on model ({int(idle)}s)"})
+                what = _CURRENT_COMMAND[0]
+                note = f"running `{what[:60]}`" if what else "waiting on model"
+                emit_progress({"kind": "waiting", "note": f"{note} ({int(idle)}s)"})
 
 
 def emit_progress(payload: dict) -> None:
@@ -268,6 +284,56 @@ def emit_progress(payload: dict) -> None:
 
 def emit_question(payload: dict) -> None:
     print(QUESTION_MARKER + json.dumps(payload), flush=True)
+
+def _descendants(pid: int) -> list[int]:
+    """Every descendant of ``pid``, collected from a single ``ps`` snapshot.
+
+    Collected BEFORE anything is killed: once a parent dies its children are
+    reparented to launchd/init and the link back to ``pid`` is gone.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=10,
+        ).stdout
+    except Exception:  # noqa: BLE001 - fall back to the process group alone
+        return []
+    children: dict[int, list[int]] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found: list[int] = []
+    stack = [pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            found.append(child)
+            stack.append(child)
+    return found
+
+
+def _kill_posix_tree(pid: int) -> None:
+    """Kill ``pid``, every descendant, and each of their process groups.
+
+    Process groups alone are not enough: ``uv run`` starts its child in a
+    process group of its own, so ``killpg`` on the shell's group left
+    ``pytest`` running. In one live run that left two dozen processes scanning
+    the whole disk for up to 1h47m after their workers were dead. Walking the
+    tree reaches them whatever group they moved to.
+    """
+    own_group = os.getpgrp()
+    for target in [pid, *_descendants(pid)]:
+        try:
+            group = os.getpgid(target)
+            # Never signal our own group — that would kill the caller itself.
+            if group != own_group:
+                os.killpg(group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.kill(target, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def kill_tree(pid: int) -> None:
@@ -280,10 +346,7 @@ def kill_tree(pid: int) -> None:
                 capture_output=True, stdin=subprocess.DEVNULL, timeout=15,
             )
         else:
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
+            _kill_posix_tree(pid)
     except Exception:  # noqa: BLE001 - cleanup must never crash the agent loop
         pass
 
@@ -349,6 +412,18 @@ class SupervisedShellBackend(LocalShellBackend):
                 exit_code=1,
                 truncated=False,
             )
+        if _CD_ABSOLUTE_RE.search(command):
+            return ExecuteResponse(
+                output=(
+                    "Error: refusing `cd` to an absolute path. Commands already run from the "
+                    "repository root. `/` in the file tools means the repository root, but in "
+                    "the shell it is the real filesystem root — `cd /` would run your command "
+                    "against the whole disk. Drop the `cd` and use relative paths, e.g. "
+                    "`python -m pytest -q` or `cd calc && ...`."
+                ),
+                exit_code=1,
+                truncated=False,
+            )
         allowed, reason = git_command_allowed(command)
         if not allowed:
             return ExecuteResponse(output=f"Error: {reason}", exit_code=1, truncated=False)
@@ -361,6 +436,7 @@ class SupervisedShellBackend(LocalShellBackend):
         })
 
         script_path: str | None = None
+        _CURRENT_COMMAND[0] = command
         try:
             if self._bash_path:
                 fd, script_path = tempfile.mkstemp(suffix=".sh", dir=str(self.cwd))
@@ -406,6 +482,7 @@ class SupervisedShellBackend(LocalShellBackend):
                 truncated=False,
             )
         finally:
+            _CURRENT_COMMAND[0] = None
             if script_path:
                 try:
                     os.remove(script_path)
@@ -748,7 +825,7 @@ def _subagents_with_model(subagents: list[SubAgent], model: ChatLiteLLM) -> list
 MICRO_SYSTEM_PROMPT = (
     "You are a coding worker executing one small, fully specified task from a supervisor. Read the "
     "\"Read first\" files, then make the minimal change described, touching only the allowed files. "
-    "Use relative paths. Run the acceptance command; if it fails, fix your change and rerun; when "
+    "Use relative paths; commands already run from the repository root, so never `cd /` (in the shell `/` is the real filesystem root, not the repo). Run the acceptance command; if it fails, fix your change and rerun; when "
     "it exits 0, write a summary of at most 3 sentences and STOP. Do not refactor, rename, "
     "reformat, add features, or edit files outside the allowed list. Never use git for anything "
     "except status/diff/log/add — inspection and staging only, never commit (the supervisor "
@@ -763,7 +840,7 @@ SYSTEM_PROMPT = (
     "Work only inside the current working directory; never scan the filesystem or drive root "
     "(no `find /`, no drive-wide searches) — everything you need is in the working directory. "
     "Always use RELATIVE paths for file operations (src/app.js, not /abs/path or C:/...) — "
-    "absolute paths are remapped under the virtual root and your files land in the wrong place. "
+    "absolute paths are remapped under the virtual root and your files land in the wrong place. Shell commands already run from the repository root: never `cd /`, which in the shell is the real filesystem root, not the repo. "
     "Never run git push, merge, rebase onto other branches, or destructive commands. "
     "Use the implementer/tester/reviewer subagents when helpful. "
     "Communicate upward while you work: call report_progress at each phase transition, "
