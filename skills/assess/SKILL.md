@@ -6,7 +6,9 @@ description: When the user asks for implementation work that spans several files
 # Monkey assess (advice only)
 
 Apply the rules from the monkey-army skill's Assessment mode:
-- < ~20 lines or unknown-cause debugging → DO IT YOURSELF.
+- < ~300 lines of code in total, a request that is already a complete spec, or unknown-cause
+  debugging → DO IT YOURSELF. (Measured: a fully-specified ~115-line feature cost 2.8× more
+  delegated than written directly — the supervisor's fixed overhead outweighed it.)
 - Multi-file mechanical or fully understood work whose code will be ≥ 3× the spec → DELEGATE.
 - Otherwise BORDERLINE (name the deciding factor).
 

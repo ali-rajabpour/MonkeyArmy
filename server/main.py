@@ -79,8 +79,8 @@ async def _offload(fn, *args, **kwargs):
         "Starts an autonomous coding worker on an isolated git worktree and returns a task_id "
         "IMMEDIATELY — the worker runs in the background and you stay free. Probes the profile "
         "first and refuses before creating anything if it fails. allowed_files unrestricted is "
-        "allowed but returned as a warning. Supervise with wait_for_tasks, not polling; review "
-        "with task_result then review_task/integrate_task when done."
+        "allowed but returned as a warning. Supervise with wait_for_tasks(include_results=True), "
+        "not polling; then review_task(approve, integrate=True) or reject."
     )
 )
 async def dispatch_task(
@@ -311,35 +311,38 @@ async def task_result(task_id: str, include_patch: bool = True) -> str:
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
-    diffstat = j.get("diffstat")
+    return json.dumps(_result_payload(j, cfg, include_patch))
+
+
+def _result_payload(j: dict[str, Any], cfg: Defaults, include_patch: bool = True) -> dict[str, Any]:
+    """Everything the supervisor needs to review a finished task — shared by
+    task_result and wait_for_tasks(include_results=True)."""
     patch = read_patch(j["patchPath"], cfg.max_diff_lines) if include_patch and j.get("patchPath") else None
     status = j.get("status")
-    return json.dumps(
-        {
-            "task_id": task_id,
-            "title": j.get("title"),
-            "status": status,
-            "attempt": j.get("attempt", 1),
-            "review": j.get("review"),
-            "verification": j.get("verification"),
-            "scope": j.get("scope"),
-            "diffstat": diffstat,
-            "patch": patch,
-            "patch_path": j.get("patchPath"),
-            "files_changed": j.get("filesChanged", []),
-            "cost_usd": j.get("costUsd"),
-            "total_tokens": j.get("totalTokens"),
-            "priced": j.get("priced", False),
-            "models_seen": j.get("modelsSeen", []),
-            "summary": j.get("summary"),
-            "error": j.get("error"),
-            "salvaged": j.get("salvaged", False),
-            "branch": j.get("branch"),
-            "worktree": j.get("worktree"),
-            "next": ("review_task(task_id, 'approve'|'reject', feedback)"
-                     if status == "succeeded" else "cleanup_task(task_id)"),
-        }
-    )
+    return {
+        "task_id": j.get("taskId"),
+        "title": j.get("title"),
+        "status": status,
+        "attempt": j.get("attempt", 1),
+        "review": j.get("review"),
+        "verification": j.get("verification"),
+        "scope": j.get("scope"),
+        "diffstat": j.get("diffstat"),
+        "patch": patch,
+        "patch_path": j.get("patchPath"),
+        "files_changed": j.get("filesChanged", []),
+        "cost_usd": j.get("costUsd"),
+        "total_tokens": j.get("totalTokens"),
+        "priced": j.get("priced", False),
+        "models_seen": j.get("modelsSeen", []),
+        "summary": j.get("summary"),
+        "error": j.get("error"),
+        "salvaged": j.get("salvaged", False),
+        "branch": j.get("branch"),
+        "worktree": j.get("worktree"),
+        "next": ("review_task(task_id, 'approve', integrate=True) | review_task(task_id, 'reject', feedback)"
+                 if status == "succeeded" else "cleanup_task(task_id)"),
+    }
 
 
 @mcp.tool(
@@ -511,13 +514,16 @@ async def cleanup_task(task_id: str, delete_branch: bool | None = None) -> str:
 
 @mcp.tool(
     description=(
-        "Records your verdict on a finished ('succeeded') task. 'approve' unlocks integrate_task "
-        "— nothing merges without this. 'reject' (needs feedback, >=10 chars) re-spawns the worker "
-        "in the SAME worktree with your feedback appended to the brief, incrementing attempt "
-        "(max 3 — beyond that, do it yourself or re-decompose into a fresh task)."
+        "Records your verdict on a 'succeeded' task. 'approve' unlocks integration; with "
+        "integrate=True it also merges in the same call. 'reject' (feedback >=10 chars) re-runs the "
+        "worker in the SAME worktree with your feedback, incrementing attempt (max 3 — then do it "
+        "yourself or re-decompose)."
     )
 )
-async def review_task(task_id: str, verdict: str, feedback: str | None = None) -> str:
+async def review_task(
+    task_id: str, verdict: str, feedback: str | None = None,
+    integrate: bool = False, integrate_mode: str | None = None,
+) -> str:
     cfg = _cfg()
     j = get_job_with_fallback(task_id)
     if not j:
@@ -534,6 +540,11 @@ async def review_task(task_id: str, verdict: str, feedback: str | None = None) -
             )
         j["review"] = {"verdict": "approve", "feedback": feedback, "at": time.time()}
         persist_job(j)
+        if integrate:
+            # Approve and merge in one round trip; the review is still
+            # recorded first, so I5 (no integration without approval) holds.
+            merged = await _integrate(j, cfg, None, integrate_mode)
+            return json.dumps({"task_id": task_id, "review": j["review"], "integrate": merged})
         return json.dumps({"task_id": task_id, "review": j["review"], "next": "integrate_task(task_id)"})
 
     # reject
@@ -576,15 +587,26 @@ async def review_task(task_id: str, verdict: str, feedback: str | None = None) -
 
 @mcp.tool(
     description=(
-        "Waits, sleeping in 1s ticks server-side, until any listed task changes status or needs "
-        "input; returns immediately if one already does. Prefer this over polling; each poll turn "
-        "re-sends your whole context. Hard cap 170s per call — call again to keep waiting on tasks "
-        "still running."
+        "Waits server-side until any listed task changes status or needs input; returns at once if "
+        "one already does. Prefer this over polling; each poll turn re-sends your whole context. "
+        "include_results=True attaches each finished task's full result (verification, patch), "
+        "saving a task_result call. Hard cap 170s — call again for tasks still running."
     )
 )
-async def wait_for_tasks(task_ids: list[str], timeout_s: int | None = None) -> str:
+async def wait_for_tasks(
+    task_ids: list[str], timeout_s: int | None = None, include_results: bool = False,
+) -> str:
     cfg = _cfg()
     result = await jobs_wait_for_tasks(task_ids, timeout_s, cfg.wait_timeout_s, cfg.wait_hard_cap_s)
+    if include_results:
+        # Every supervisor round trip re-sends its whole context. Folding the
+        # finished tasks' results into the wait saves one task_result call
+        # per task (measured live: 28 supervisor requests for 3 small tasks).
+        for row in result.get("tasks", []):
+            if row.get("done"):
+                j = get_job_with_fallback(row["task_id"])
+                if j:
+                    row["result"] = _result_payload(j, cfg)
     return json.dumps(result)
 
 
@@ -604,15 +626,23 @@ async def integrate_task(
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
-    integrate_mode = mode or cfg.integrate_mode
+    return json.dumps(await _integrate(j, cfg, message, mode, allow_branch_mismatch))
+
+
+async def _integrate(
+    j: dict[str, Any], cfg: Defaults, message: str | None, mode: str | None,
+    allow_branch_mismatch: bool = False,
+) -> dict[str, Any]:
+    """Shared by integrate_task and review_task(approve, integrate=True)."""
     try:
-        result = await _offload(git_ops.integrate, j, j["repo"], message, integrate_mode, allow_branch_mismatch)
+        return await _offload(
+            git_ops.integrate, j, j["repo"], message, mode or cfg.integrate_mode, allow_branch_mismatch
+        )
     except Exception as e:  # noqa: BLE001 - never leak a raw traceback to the supervisor
-        return json.dumps({
-            "task_id": task_id, "integrated": False, "reason": "error",
+        return {
+            "task_id": j.get("taskId"), "integrated": False, "reason": "error",
             "detail": f"{type(e).__name__}: {e}",
-        })
-    return json.dumps(result)
+        }
 
 
 @mcp.tool(

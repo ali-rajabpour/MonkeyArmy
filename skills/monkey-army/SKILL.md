@@ -21,7 +21,8 @@ configuration unless the user explicitly asks. If `doctor` has never run on this
 ## 1. Assessment mode (advice only)
 If the user asks *whether* to delegate ("should we delegate this?", "assess this"), you are asked
 for a verdict, NOT to run the loop. Do not decompose or dispatch. Apply:
-- < ~20 changed lines, or 1–2 files of trivial edits → **DO IT YOURSELF** (spec costs ≥ code).
+- < ~300 changed lines in total, 1–2 files of trivial edits, or a request that is already a
+  complete spec → **DO IT YOURSELF** (see §1.5 for the measurement).
 - Solution path unknown (bug of unknown cause, unfamiliar code) → **DO IT YOURSELF** first, then
   reassess.
 - Multiple files of mechanical or well-understood work → **DELEGATE**.
@@ -29,6 +30,28 @@ for a verdict, NOT to run the loop. Do not decompose or dispatch. Apply:
 - Rule of thumb: delegate a task only when the code the worker will write is at least ~3× the
   size of the spec you must write for it.
 Return DELEGATE / DO IT YOURSELF / BORDERLINE with a one-line reason, then stop and wait.
+
+## 1.5 Gate — refuse work that won't pay (mandatory, before the loop)
+Running the loop has a fixed cost on YOUR side: every dispatch, wait, review and integrate is a
+round trip that re-sends your whole context. Measured on this plugin: a fully-specified ~115-line
+feature cost **2.8× more** delegated ($1.78 Opus + workers) than written directly ($0.65), because
+that overhead exceeded the whole cost of writing the code. So, before anything else, estimate:
+
+- **code** — total lines the workers would write for the whole request;
+- **spec** — the lines of spec you would have to write (if the user's request already names every
+  function, signature, message and test, the request IS the spec).
+
+**Refuse** when any of these hold:
+- code < ~300 lines in total;
+- code < 3 × spec;
+- the request is already a complete spec for work you could type in one pass.
+
+Refusing means: one line with your estimate and the reason, then *"I'll implement this directly —
+say 'delegate anyway' to run the monkeys regardless."* Stop there; do not decompose or dispatch.
+If the user says **delegate anyway**, run the loop without re-arguing.
+
+Delegate when the work is large and mechanical: many files, repetitive patterns, hundreds of
+lines whose design is already settled — that is where your fixed overhead is spread thin.
 
 ## 2. The loop
 ```
@@ -50,6 +73,8 @@ it, bake it into the spec, shrink the task.
   inline, conventions to follow, `allowed_files`, `context_files`, acceptance.
 - **TDD split for logic:** task A = "write these N test cases in <test file>" (you list them),
   you review the tests; task B = "make them pass in <file>". The tests become the objective gate.
+- **Prefer fewer, larger tasks.** Each task costs you ~3 round trips; don't split what one task
+  can do inside ~200 lines. Skip the TDD split when the user's request already lists the tests.
 - Independent tasks must have **disjoint `allowed_files`**; dependent tasks run in waves.
 - Register the plan: `batch(action="create", repo_path, goal, tasks_json=[{key,title,dependsOn,allowedFiles}])`.
   Show the user the plan (the returned `order` waves) before dispatching.
@@ -63,8 +88,9 @@ Use `mode="micro"` (default). Use `mode="task"` only for a coherent multi-file l
 deliberately chose not to split. Do not pass `profile` unless the user asked for a specific one.
 
 ### 2.4 Wait and supervise (never idle-poll)
-Call `wait_for_tasks(task_ids)` — it returns on the first state change. Every extra poll turn
-re-sends your whole context; `wait_for_tasks` is the cheap path.
+Call `wait_for_tasks(task_ids, include_results=True)` — it returns on the first state change,
+and every finished task arrives with its full result (verification, scope, diffstat, patch).
+Every extra poll turn re-sends your whole context; this is the cheap path.
 - `needs_input`: read the question. Answer from your own context with `answer_worker` when it is
   an implementation detail you already decided; relay to the user only genuine product decisions.
   Answer promptly — the worker is blocked.
@@ -73,20 +99,23 @@ re-sends your whole context; `wait_for_tasks` is the cheap path.
 - Use `task_progress` only when something looks stuck; never read raw logs.
 
 ### 2.5 Review — you do it, never a subagent
-On `done`: `task_result(task_id)`. Then, in this order:
+On `done`, review the `result` the wait returned — call `task_result` only if it is missing.
+Then, in this order:
 1. `verification.passed` must be true and `scope.ok` must be true. If not, the status tells you
    why (`failed_verification`, `failed_scope`, `failed_oversized`); the patch is still there.
 2. Read the patch (inlined when small; otherwise open `patch_path`) against
    `references/review-checklist.md`: does it do exactly what you specified, in the repo's style,
    with no silent fallbacks, swallowed errors, scope creep, dead code, or misleading names? Are the
    tests meaningful? Would you have written it this way?
-3. Judge: `review_task(task_id, "approve")` — or `review_task(task_id, "reject", feedback)` with
+3. Judge: `review_task(task_id, "approve", integrate=True)` — approves and merges in one call —
+   or `review_task(task_id, "reject", feedback)` with
    the **exact** problem, the root cause, and the fix you want. You diagnose; the monkey retypes in
    the same worktree. After two rejects, stop: do it yourself or re-decompose.
 Never trust `summary`. Never approve on "tests pass" alone — read the diff.
 
 ### 2.6 Integrate
-After approving a task: `integrate_task(task_id)` (default mode from config: `commit` = one
+Approving with `integrate=True` already merged it. Use `integrate_task(task_id)` only for a task
+approved without it, or with `mode="stage"` (default mode from config: `commit` = one
 squash commit on the user's current branch; `stage` = leave staged for the user to commit).
 Integrate in dependency order. On `conflict` (base moved), do not hand-resolve: re-dispatch that
 task against the current branch and review it again — micro-tasks are cheap. The worker's
@@ -105,6 +134,7 @@ added to the repo notes (`configure(action="add_note", …)`) for future runs �
 only durable operational facts ("tests need `uv run pytest -q`").
 
 ## 3. Rules
+- While the loop runs, one short line per step. Narration is output tokens — the expensive kind.
 - Never write implementation code yourself, except ≤ 20-line glue that would cost more to specify.
 - Never dispatch a task that requires a design decision; make the decision first.
 - Never trust the worker's summary or claimed success; the server's `verification` and your

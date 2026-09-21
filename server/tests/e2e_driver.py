@@ -600,11 +600,17 @@ async def phase1(ctx: Ctx) -> None:
         record("T1.3 user repo clean right after dispatch", status_during.strip() == status_before.strip(), status_during)
 
         await ctx.wait_done([task_a])
-        r = await ctx.call("task_result", task_id=task_a)
+        # Task A takes the short supervisor path (3 calls per task): the wait
+        # carries the finished task's result, and approval integrates in the
+        # same call. Task B below keeps the long path, so both stay covered.
+        w = await ctx.call("wait_for_tasks", task_ids=[task_a], timeout_s=1, include_results=True)
+        row = next((t for t in w.get("tasks", []) if t.get("task_id") == task_a), {})
+        r = row.get("result") or {}
+        record("T1.2 wait_for_tasks carries the finished result", bool(r) and "verification" in r, json.dumps(row)[:300])
         record("T1.2 task A succeeded", r.get("status") == "succeeded", json.dumps({"status": r.get("status"), "error": r.get("error")}))
-        await ctx.call("review_task", task_id=task_a, verdict="approve")
-        r_int = await ctx.call("integrate_task", task_id=task_a)
-        record("T1.2 task A integrated", r_int.get("integrated") is True, json.dumps(r_int))
+        r_rev = await ctx.call("review_task", task_id=task_a, verdict="approve", integrate=True)
+        r_int = r_rev.get("integrate") or {}
+        record("T1.2 task A approved and integrated in one call", r_int.get("integrated") is True, json.dumps(r_rev))
         await ctx.cleanup(task_a)
 
         r = await ctx.dispatch(

@@ -360,6 +360,18 @@ with deepagents 0.7.0a6.
   blocks on the probe — the supervisor's tool call would have outlived Claude Code's own MCP
   timeout.
 
+2026-09-22 (after A/B run 1):
+- `/monkey-army` refuses work that won't pay — under ~300 lines of code in total, under 3× the
+  spec, or a request that is already a complete spec — and offers to implement directly;
+  "delegate anyway" overrides. Evidence: A/B run 1 (a fully-specified ~115-line feature) cost
+  2.8× more delegated than written directly, because the supervisor's fixed per-round-trip
+  overhead exceeded the cost of writing the code. The threshold is provisional until the
+  large-work benchmark is run.
+- Supervisor round trips per task cut from five to three: `wait_for_tasks(include_results=True)`
+  returns finished tasks' full results, and `review_task(approve, integrate=True)` approves and
+  merges in one call. Approval is still recorded before integration, so I5 holds. The skill
+  also prefers fewer, larger tasks and one-line status output.
+
 ## VERIFY table (plan §14)
 
 | Claim | Outcome | Evidence / fallback taken |
