@@ -16,3 +16,6 @@ Screenshot*
 
 # Session handoffs are local memory, never project source.
 .claude/handoffs/
+
+# Private planning notes, kept offline.
+docs/MONKEY_ARMY_IMPLEMENTATION_PLAN.md
