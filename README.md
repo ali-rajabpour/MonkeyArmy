@@ -105,10 +105,6 @@ beyond that — this is process isolation and gate enforcement, not a container.
 - [`docs/VALIDATION.md`](docs/VALIDATION.md) — the validation checklist this plugin was tested against
 - [`ROADMAP.md`](ROADMAP.md) — what's deliberately not built yet
 
-## Lineage
-
-Derived from cc-delegate by Etienne Lescot, MIT licensed.
-
 ## License
 
 MIT — see [`LICENSE`](LICENSE).

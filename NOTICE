@@ -1,4 +1,4 @@
-Monkey Army is derived from cc-delegate by Etienne Lescot, MIT licensed.
+Portions of this project originate from cc-delegate (MIT); see LICENSE.
 
 Third-party components: this project's worker depends on deepagents (MIT
 licensed, https://github.com/langchain-ai/deepagents) and litellm's provider

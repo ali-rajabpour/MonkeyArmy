@@ -2,7 +2,7 @@
 
 ## 0.1.0 — 2026-09-21
 
-First release. Forked from cc-delegate by Etienne Lescot (MIT) and rebuilt as Monkey Army.
+First release.
 
 ### What it does
 

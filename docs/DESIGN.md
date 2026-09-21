@@ -58,7 +58,7 @@ I7. Every worker run has hard limits: recursion, wall-clock, stall, per-command 
 I8. Secrets never enter the model conversation (elicitation for keys), never reach worker shell
     commands (env filtering), and the worker process receives only its own provider key.
 I9. Configuration changes happen only on explicit user request (skill rule + tool descriptions).
-I10. Licensing & attribution: MIT; `NOTICE` credits cc-delegate and third-party components.
+I10. Licensing & attribution: MIT; `LICENSE` and `NOTICE` carry every required notice.
 
 ## Data model
 
@@ -380,7 +380,3 @@ subsections 6.1–6.13 define 13 distinct tools (`dispatch_task`, `wait_for_task
 `task_progress`, `answer_worker`, `steer_task`, `cancel_task`, `task_result`, `review_task`,
 `integrate_task`, `batch`, `cleanup_task`, `configure`). All 13 are implemented; the heading
 count is stale and documented here rather than silently dropping a tool to match it.
-
-## Lineage
-
-Derived from cc-delegate by Etienne Lescot, MIT licensed. See `NOTICE` for full attribution.
