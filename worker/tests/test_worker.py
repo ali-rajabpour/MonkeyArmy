@@ -457,5 +457,30 @@ class TestKillTreeReachesOtherProcessGroups(unittest.TestCase):
         self.assertFalse(alive, "grandchild in another process group survived kill_tree")
 
 
+class TestStreamTokens(unittest.TestCase):
+    """The token cap is checked against usage reported ON the streamed
+    messages, because litellm's success callbacks lag on a background thread:
+    a one-call task finished before the tracker saw a token (observed live)."""
+
+    def _msg(self, mid, total, as_dict=True):
+        usage = {"input_tokens": total - 1, "output_tokens": 1, "total_tokens": total}
+        return SimpleNamespace(id=mid, usage_metadata=usage if as_dict else SimpleNamespace(total_tokens=total))
+
+    def test_sums_new_messages_once(self):
+        seen = set()
+        batch = [self._msg("a", 300), self._msg("b", 50)]
+        self.assertEqual(worker._stream_tokens(batch, seen), 350)
+        # the same messages streamed again (full history) are not recounted
+        self.assertEqual(worker._stream_tokens(batch + [self._msg("c", 7)], seen), 7)
+
+    def test_ignores_messages_without_usage(self):
+        seen = set()
+        msgs = [SimpleNamespace(id="u", usage_metadata=None), SimpleNamespace(id="t")]
+        self.assertEqual(worker._stream_tokens(msgs, seen), 0)
+
+    def test_accepts_attribute_style_usage(self):
+        self.assertEqual(worker._stream_tokens([self._msg("x", 12, as_dict=False)], set()), 12)
+
+
 if __name__ == "__main__":
     unittest.main()

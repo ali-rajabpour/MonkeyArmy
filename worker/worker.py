@@ -988,6 +988,31 @@ def run_selftest() -> int:
     return 0
 
 
+def _stream_tokens(messages: list, seen: set) -> int:
+    """Tokens reported on AI messages in `messages` not yet counted.
+
+    litellm runs success callbacks on a background thread, so CostTracker's
+    count lags the stream: a one-step task could finish before the tracker
+    saw a single token, and the token cap never fired (observed live: a
+    1-token cap on a one-call task reported "worker made no changes"). Each
+    AI message carries `usage_metadata` synchronously, so the cap is checked
+    against that instead.
+    """
+    total = 0
+    for m in messages or []:
+        usage = getattr(m, "usage_metadata", None)
+        if not usage:
+            continue
+        key = getattr(m, "id", None) or id(m)
+        if key in seen:
+            continue
+        seen.add(key)
+        value = usage.get("total_tokens") if isinstance(usage, dict) else getattr(usage, "total_tokens", None)
+        if isinstance(value, (int, float)):
+            total += int(value)
+    return total
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--worktree", default=None)
@@ -1125,6 +1150,8 @@ def main() -> int:
         accumulated_messages: list = []
         budget_exceeded = False
         budget_reason = ""
+        stream_tokens = 0
+        counted_messages: set = set()
         heartbeat = Heartbeat()
         heartbeat.start()
         for update in agent.stream(
@@ -1139,6 +1166,7 @@ def main() -> int:
                     delta = node_state.get("messages")
                     if isinstance(delta, list):
                         messages_delta = delta
+                stream_tokens += _stream_tokens(messages_delta or [], counted_messages)
                 if messages_delta is not None and len(messages_delta) > len(accumulated_messages):
                     accumulated_messages = messages_delta
 
@@ -1157,15 +1185,16 @@ def main() -> int:
                 # most one model call past the cap. The token cap works even
                 # when the model has no known price (cost stays 0/unpriced).
                 over_budget = args.max_budget_usd is not None and tracker.cost_usd > args.max_budget_usd
+                tokens_so_far = max(tracker.total_tokens, stream_tokens)
                 over_tokens = (
-                    args.max_tokens_total is not None and tracker.total_tokens > args.max_tokens_total
+                    args.max_tokens_total is not None and tokens_so_far > args.max_tokens_total
                 )
                 if over_budget or over_tokens:
                     budget_exceeded = True
                     budget_reason = (
                         f"cost ${tracker.cost_usd:.4f} crossed the ${args.max_budget_usd:.2f} USD cap"
                         if over_budget
-                        else f"{tracker.total_tokens} tokens crossed the {args.max_tokens_total} token cap"
+                        else f"{tokens_so_far} tokens crossed the {args.max_tokens_total} token cap"
                     )
                     emit_progress({"kind": "report", "note": f"budget exceeded: {budget_reason}; stopping"})
                     break
