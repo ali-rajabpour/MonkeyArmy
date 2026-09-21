@@ -167,4 +167,12 @@ To be filled from the user's A/B run — no numbers fabricated.
 
 | Run | Feature | Total cost (A, Opus alone) | Total cost (B, monkey-army) | Worker cost | Worker tokens | Tasks | Attempts (total) | Quality equivalent? | B / A ratio |
 |---|---|---|---|---|---|---|---|---|---|
-| | | | | | | | | | |
+| 1 (2026-09-22) | calc: 4 ops + CLI + tests (~115 lines) | $0.65 | ~$1.85 ($1.78 Opus + ~$0.07 workers, est.) | ~$0.07 (unpriced profile; est. at DeepSeek list prices) | 202,075 | 3 | 4 (one re-dispatch after a supervisor-written verify command failed) | yes — 15/15 tests both; add/multiply untouched | **≈ 2.8** |
+
+**Run 1 fails the target, and by the plugin's own rule it should have.** The brief was already a
+complete spec and the code it produced was about the same size, so the code-to-spec ratio was
+~1×, far below the 3× the granularity rule asks for; `assess` would have said *do it yourself*.
+Opus alone needed 4 requests and 2.2k output tokens. The supervisor made 28 round trips (1.8M
+cache-read tokens, 9.7k output), so its fixed overhead exceeded the whole cost of just writing
+the code. This measures where delegation does **not** pay: small, fully-specified features.
+Whether it pays on large mechanical work (hundreds of lines per spec) is still unmeasured.
