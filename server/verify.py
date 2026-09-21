@@ -308,7 +308,14 @@ def finalize_success(job: dict[str, Any], cfg: Defaults) -> None:
 
     if job["diffstat"]["lines"] == 0 and not d["files"]:
         job["status"] = "failed"
+        # Keep WHY the worker stopped. A budget/token cap that fires before
+        # the first edit lands here with an empty diff, and reporting only
+        # "worker made no changes" threw away the one fact the supervisor
+        # needs — that the cap stopped it, not the task being impossible.
         job["error"] = "worker made no changes"
+        worker_error = job.get("workerError")
+        if worker_error:
+            job["error"] += f" ({worker_error})"
         _checkpoint("failed")
         return
 

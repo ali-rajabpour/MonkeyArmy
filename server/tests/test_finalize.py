@@ -193,5 +193,25 @@ class TestBranchHistoryTamper(_FinalizeCase):
         self.assertIsNotNone(job.get("finishedAt"))
 
 
+class TestEmptyDiffKeepsCapReason(_FinalizeCase):
+    """A budget/token cap that fires before the first edit reaches
+    finalize_success with an empty diff. Reporting only "worker made no
+    changes" threw away the one fact the supervisor needs — which cap
+    stopped it (observed live on T4.3/T4.4)."""
+
+    def test_cap_reason_is_kept(self):
+        job = self._job(workerError="budget exceeded: cost $0.0123 crossed the $0.01 USD cap")
+        finalize_success(job, self._cfg())
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("worker made no changes", job["error"])
+        self.assertIn("$0.01 USD cap", job["error"])
+
+    def test_without_a_worker_error_the_message_is_unchanged(self):
+        job = self._job()
+        finalize_success(job, self._cfg())
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error"], "worker made no changes")
+
+
 if __name__ == "__main__":
     unittest.main()

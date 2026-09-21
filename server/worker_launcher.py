@@ -453,6 +453,9 @@ async def run_worker(
     # checks, caps the diff, and commits. The one exception is a worker
     # failure that left nothing changed — nothing for the pipeline to do.
     job["workerClaimedStatus"] = result.get("status")
+    # Kept so finalize_success can explain an empty diff that a cap caused.
+    if result.get("error"):
+        job["workerError"] = result["error"]
     job.pop("question", None)
 
     if rt.get("cancelled"):
