@@ -8,6 +8,8 @@ __pycache__/
 # Screenshots and recordings — never commit these (see repo rules).
 Screenshot*
 *.png
+# ...except deliberate repo artwork, which lives only here.
+!docs/assets/*.png
 *.gif
 *.mov
 *.mp4

@@ -1,3 +1,5 @@
+<img src="docs/assets/banner.png" alt="Monkey Army" width="100%">
+
 # Monkey Army
 
 Opus commands, monkeys type, Opus signs off. A Claude Code plugin that delegates
