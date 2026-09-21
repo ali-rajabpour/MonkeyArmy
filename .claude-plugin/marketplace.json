@@ -1,10 +1,20 @@
 {
   "name": "monkey-army",
-  "owner": { "name": "Ali Rajabpour" },
+  "owner": {
+    "name": "Ali Rajabpour"
+  },
   "version": "1.0.0",
   "description": "Marketplace hosting the Monkey Army plugin.",
   "plugins": [
-    { "name": "monkey-army", "source": "./", "version": "0.1.0",
-      "keywords": ["delegation", "mcp", "cost-optimization"] }
+    {
+      "name": "monkey-army",
+      "source": "./",
+      "version": "0.2.0",
+      "keywords": [
+        "delegation",
+        "mcp",
+        "cost-optimization"
+      ]
+    }
   ]
 }

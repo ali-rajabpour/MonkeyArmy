@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.0 — 2026-09-22
+
+Driven by the first A/B measurement: a fully-specified ~115-line feature cost 2.8× more when
+delegated than when written directly, because the supervisor's fixed overhead exceeded the cost of
+the code itself.
+
+### Changed
+
+- **`/monkey-army` refuses work that won't pay.** Under ~300 lines of code in total, under 3× the
+  spec, or a request that is already a complete spec: it says so in one line and offers to
+  implement directly. "delegate anyway" overrides. `assess` uses the same thresholds.
+- **Supervisor round trips per task: five → three.** `wait_for_tasks(include_results=True)`
+  returns finished tasks' full results (no separate `task_result` call), and
+  `review_task(approve, integrate=True)` approves and merges in one call. Approval is still
+  recorded before any merge.
+- The skill prefers fewer, larger tasks, skips the TDD split when the request already lists the
+  tests, and keeps its status output to one line per step.
+
+### Added
+
+- `docs/TOKEN-ECONOMICS.md`: a ready-to-run A/B benchmark and the recorded result of run 1.
+
 ## 0.1.0 — 2026-09-21
 
 First release, under AGPL-3.0-only.
