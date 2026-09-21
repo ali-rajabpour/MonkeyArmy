@@ -58,7 +58,7 @@ I7. Every worker run has hard limits: recursion, wall-clock, stall, per-command 
 I8. Secrets never enter the model conversation (elicitation for keys), never reach worker shell
     commands (env filtering), and the worker process receives only its own provider key.
 I9. Configuration changes happen only on explicit user request (skill rule + tool descriptions).
-I10. Licensing & attribution: MIT; `LICENSE` and `NOTICE` carry every required notice.
+I10. Licensing & attribution: AGPL-3.0-only; `LICENSE` and `NOTICE` carry every required notice.
 
 ## Data model
 

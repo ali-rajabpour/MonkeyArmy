@@ -107,4 +107,4 @@ beyond that — this is process isolation and gate enforcement, not a container.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+[AGPL-3.0-only](LICENSE). If you modify Monkey Army and make it available to others — including over a network — you must publish your version's full source under the same licence and keep the copyright notices. See [`NOTICE`](NOTICE).

@@ -2,7 +2,7 @@
 
 ## 0.1.0 — 2026-09-21
 
-First release.
+First release, under AGPL-3.0-only.
 
 ### What it does
 

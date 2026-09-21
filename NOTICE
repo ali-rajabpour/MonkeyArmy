@@ -1,4 +1,14 @@
-Portions of this project originate from cc-delegate (MIT); see LICENSE.
+Monkey Army
+Copyright (C) 2026 Ali Rajabpour
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3 only (SPDX: AGPL-3.0-only). See LICENSE.
+
+If you modify this program and make it available to others -- including by
+letting users interact with it over a network -- you must offer them the
+complete corresponding source of your version under the same licence, and
+keep this notice and the copyright notices above intact.
 
 Third-party components: this project's worker depends on deepagents (MIT
 licensed, https://github.com/langchain-ai/deepagents) and litellm's provider
@@ -6,3 +16,28 @@ routing to reach third-party model endpoints. As a Claude Code plugin, it also
 runs inside Anthropic's Claude Code engine on the supervisor side, governed by
 Anthropic's Commercial Terms of Service. Review 9Router's and your chosen
 worker provider's terms before production use.
+
+--------------------------------------------------------------------------------
+
+Portions of this project originate from cc-delegate and remain available under
+the MIT License, whose notice must accompany them:
+
+Copyright (c) Etienne Lescot
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
