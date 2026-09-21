@@ -57,6 +57,110 @@ Target: total cost of (B) ≤ 0.6× total cost of (A), with equal quality. If yo
 the tasks were probably too small for the granularity rule above — widen them and re-run before
 trusting the number.
 
+## Running it: the calc benchmark
+
+A ready-made feature for the protocol above, sized to the sweet spot and fully specified so both
+runs build the same thing. About 150 changed lines, splitting naturally into ~5 tasks.
+
+### 1. Two identical starting points
+
+```bash
+for run in A B; do
+  rm -rf /tmp/ab-$run
+  cp -r examples/toy-repo /tmp/ab-$run
+  (cd /tmp/ab-$run && git init -q -b main && git add . && git commit -qm init)
+done
+```
+
+### 2. Fairness rules
+
+- **Fresh session for each run**: `cd /tmp/ab-A && cc-coder` (not `--resume` / `--continue`).
+- **Same persona, model and effort** for both. The persona and its tools cost tokens in both runs
+  equally; changing it between runs breaks the comparison. `cc-coder` is the one with the
+  monkeys tools enabled.
+- **Paste the prompt, then stay out of it.** Answer questions if asked; don't steer, don't review
+  the code early, don't paste extra context. Every message you add is cost the run didn't need.
+- **Measure before you read the code.** Type `/cost` the moment the run says it's done.
+
+### 3. The feature brief (identical in both prompts)
+
+```text
+Feature: extend the calc package with four operations.
+
+Library — calc/__init__.py, matching the existing style (plain functions, one-line docstrings):
+- subtract(a, b) returns a - b
+- divide(a, b) returns a / b (true division, a float). If b == 0, raise ValueError("division by zero").
+- power(a, b) returns a ** b
+- modulo(a, b) returns a % b. If b == 0, raise ValueError("modulo by zero").
+
+CLI — calc/cli.py: add subcommands subtract, divide, power and modulo. Each takes two int
+arguments exactly like the existing add and multiply, and prints the result. If the operation
+raises ValueError, print "error: <message>" to stderr and have main() return 2.
+
+Tests — tests/test_calc.py:
+- one normal-case test per new function;
+- for divide and modulo, a test that b == 0 raises ValueError with the exact message;
+- one CLI test per new subcommand checking the printed output;
+- one CLI test that `divide 1 0` prints the error to stderr and returns 2.
+
+Acceptance: `uv run --no-project --with pytest python -m pytest -q` passes, including the
+existing tests.
+
+Constraints: no new dependencies; do not change add, multiply or their tests; do not reformat
+unrelated code.
+```
+
+### 4. Prompt A — Opus alone (run in `/tmp/ab-A`)
+
+```text
+Implement the following feature yourself, directly in this repository. Do not delegate: do not
+use monkey-army, subagents, or any worker tools. Run the acceptance command until it passes,
+then stop and tell me you are done.
+
+<paste the feature brief here>
+```
+
+### 5. Prompt B — monkey-army (run in `/tmp/ab-B`)
+
+```text
+/monkey-army:monkey-army Implement the following feature. Use the full monkey-army loop for all
+implementation work, integrate with mode=commit, and when the batch is finished show me the batch
+report (worker cost and tokens included).
+
+<paste the feature brief here>
+```
+
+### 6. Record
+
+In each session, as soon as it reports done:
+
+```text
+/cost
+```
+
+Then, from any terminal:
+
+```bash
+# both must pass
+for run in A B; do (cd /tmp/ab-$run && uv run --no-project --with pytest python -m pytest -q | tail -1); done
+
+# the two diffs, side by side, for the quality read
+for run in A B; do echo "=== $run"; git -C /tmp/ab-$run diff --stat $(git -C /tmp/ab-$run rev-list --max-parents=0 HEAD); done
+git -C /tmp/ab-A diff $(git -C /tmp/ab-A rev-list --max-parents=0 HEAD) > /tmp/ab-A.diff
+git -C /tmp/ab-B diff $(git -C /tmp/ab-B rev-list --max-parents=0 HEAD) > /tmp/ab-B.diff
+```
+
+For B, **total cost = session B's `/cost` + `workerCostUsd` from the batch report** — the
+supervisor alone is not the whole bill. Put both runs in the table below.
+
+On a subscription plan `/cost` shows what the tokens would cost rather than what you are billed.
+That is fine here: the comparison is the ratio B / A, not the absolute amount.
+
+**Reading the result:** B / A ≤ 0.6 with equal quality means delegation pays on this kind of
+work. Above that, look at the batch report first — many attempts per task, or tasks of a few
+lines each, mean the tasks were cut too small; re-cut them larger and run B again before
+trusting the number.
+
 ## Results
 
 To be filled from the user's A/B run — no numbers fabricated.
