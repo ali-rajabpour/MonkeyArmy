@@ -11,6 +11,7 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -107,6 +108,30 @@ def _parse_body(raw: str) -> Any:
 def _request(
     url: str, api_key: str | None, *, method: str = "GET",
     body: dict[str, Any] | None = None, timeout_s: float = 10,
+) -> tuple[int, Any]:
+    """One HTTP round trip with a hard TOTAL deadline of `timeout_s`.
+
+    urllib's `timeout` bounds each socket operation, not the request: a
+    degraded server that trickles bytes kept a 30 s-timeout probe alive for
+    282 s in a live run, and dispatch_task blocks on the probe, so the
+    supervisor's tool call would outlive Claude Code's own MCP timeout. The
+    round trip runs in a daemon thread and is abandoned at the deadline — the
+    thread finishes on its own later; nothing waits for it.
+    """
+    box: list[tuple[int, Any]] = []
+    worker = threading.Thread(
+        target=lambda: box.append(_request_once(url, api_key, method, body, timeout_s)),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout_s)
+    if box:
+        return box[0]
+    return 0, {"error": f"no complete response within {timeout_s:g}s (endpoint too slow or stalled)"}
+
+
+def _request_once(
+    url: str, api_key: str | None, method: str, body: dict[str, Any] | None, timeout_s: float,
 ) -> tuple[int, Any]:
     """One HTTP round trip; never raises — a transport failure comes back as
     status 0 with an 'error' key, same shape as a parsed error body."""

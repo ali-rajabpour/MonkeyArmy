@@ -354,6 +354,12 @@ with deepagents 0.7.0a6.
   labelling every silence "waiting on model", which misreported the incident above for ten
   minutes.
 
+- Every endpoint request has a hard *total* deadline (`backend._request` runs the round trip in a
+  daemon thread and abandons it at `timeout_s`). urllib's `timeout` bounds each socket operation,
+  so a degraded router trickling bytes kept a 30 s probe alive for 282 s, and `dispatch_task`
+  blocks on the probe — the supervisor's tool call would have outlived Claude Code's own MCP
+  timeout.
+
 ## VERIFY table (plan §14)
 
 | Claim | Outcome | Evidence / fallback taken |

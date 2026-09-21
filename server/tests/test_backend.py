@@ -246,5 +246,42 @@ class TestProbeToolCallingSignals(unittest.TestCase):
         self.assertGreaterEqual(captured["max_tokens"], 64)
 
 
+class TestTotalDeadline(unittest.TestCase):
+    """urllib's timeout is per socket operation. A server that trickles one
+    byte at a time kept a 30 s-timeout probe alive for 282 s in a live run."""
+
+    def test_trickling_server_is_cut_off_at_the_deadline(self):
+        import http.server, socketserver, threading, time
+
+        class Trickle(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                for ch in '{"data": []}' * 50:     # ~600 bytes, one every 0.2 s
+                    try:
+                        self.wfile.write(ch.encode()); self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.2)
+
+            def log_message(self, *a):
+                pass
+
+        srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Trickle)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_address[1]}/v1/models"
+            start = time.time()
+            status, body = backend._request(url, None, timeout_s=1.5)
+            elapsed = time.time() - start
+        finally:
+            srv.shutdown(); srv.server_close()
+        self.assertEqual(status, 0)
+        self.assertIn("no complete response within", body["error"])
+        self.assertLess(elapsed, 4, f"deadline not enforced: took {elapsed:.1f}s")
+
+
 if __name__ == "__main__":
     unittest.main()
