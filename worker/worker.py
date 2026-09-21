@@ -1192,7 +1192,7 @@ def main() -> int:
                 if over_budget or over_tokens:
                     budget_exceeded = True
                     budget_reason = (
-                        f"cost ${tracker.cost_usd:.4f} crossed the ${args.max_budget_usd:.2f} USD cap"
+                        f"cost ${tracker.cost_usd:.4f} crossed the ${args.max_budget_usd:g} USD cap"
                         if over_budget
                         else f"{tokens_so_far} tokens crossed the {args.max_tokens_total} token cap"
                     )
