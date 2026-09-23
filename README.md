@@ -2,6 +2,8 @@
 
 # Monkey Army
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/ali-rajabpour-monkeyarmy-159s71)](https://m8ven.ai/mcp/ali-rajabpour-monkeyarmy-159s71)
+
 Opus commands, monkeys type, Opus signs off. A Claude Code plugin that delegates
 micro-tasks from a frontier-model supervisor to cheap workers (DeepSeek & co. via
 your local 9Router), isolated in disposable git worktrees, verified by the server,
