@@ -2,7 +2,7 @@
 
 # Monkey Army
 
-[![M8ven Score](https://m8ven.ai/badge/mcp/ali-rajabpour-monkeyarmy-159s71)](https://m8ven.ai/mcp/ali-rajabpour-monkeyarmy-159s71)
+[![M8ven Score](https://m8ven.ai/badge/mcp/ali-rajabpour-monkeyarmy-159s71?variant=verified)](https://m8ven.ai/mcp/ali-rajabpour-monkeyarmy-159s71)
 
 Opus commands, monkeys type, Opus signs off. A Claude Code plugin that delegates
 micro-tasks from a frontier-model supervisor to cheap workers (DeepSeek & co. via
@@ -107,6 +107,16 @@ beyond that — this is process isolation and gate enforcement, not a container.
 - [`docs/VALIDATION.md`](docs/VALIDATION.md) — the validation checklist this plugin was tested against
 - [`ROADMAP.md`](ROADMAP.md) — what's deliberately not built yet
 
+## Author
+
+**Ali Rajabpour Sanati** — [Rajabpour.com](https://Rajabpour.com)
+
+- Contact: [ali@rajabpour.com](mailto:ali@rajabpour.com) · [ali.poursanati@gmail.com](mailto:ali.poursanati@gmail.com)
+- Bugs and feature requests: [GitHub issues](https://github.com/ali-rajabpour/MonkeyArmy/issues)
+- Security reports: email rather than a public issue, please.
+
 ## License
 
 [AGPL-3.0-only](LICENSE). If you modify Monkey Army and make it available to others — including over a network — you must publish your version's full source under the same licence and keep the copyright notices. See [`NOTICE`](NOTICE).
+
+Copyright © 2026 Ali Rajabpour Sanati.

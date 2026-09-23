@@ -4,7 +4,9 @@
   "version": "0.2.0",
   "description": "Opus commands, monkeys type, Opus signs off: delegate micro-tasks from a frontier-model Claude Code supervisor to cheap workers (DeepSeek & co. via 9Router), isolated in git worktrees, verified by the server, reviewed and merged back by the supervisor.",
   "author": {
-    "name": "Ali Rajabpour"
+    "name": "Ali Rajabpour Sanati",
+    "url": "https://Rajabpour.com",
+    "email": "ali@rajabpour.com"
   },
   "repository": "https://github.com/ali-rajabpour/MonkeyArmy",
   "license": "AGPL-3.0-only",
