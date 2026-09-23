@@ -168,6 +168,7 @@ To be filled from the user's A/B run — no numbers fabricated.
 | Run | Feature | Total cost (A, Opus alone) | Total cost (B, monkey-army) | Worker cost | Worker tokens | Tasks | Attempts (total) | Quality equivalent? | B / A ratio |
 |---|---|---|---|---|---|---|---|---|---|
 | 1 (2026-09-22) | calc: 4 ops + CLI + tests (~115 lines) | $0.65 | ~$1.85 ($1.78 Opus + ~$0.07 workers, est.) | ~$0.07 (unpriced profile; est. at DeepSeek list prices) | 202,075 | 3 | 4 (one re-dispatch after a supervisor-written verify command failed) | yes — 15/15 tests both; add/multiply untouched | **≈ 2.8** |
+| 2 (2026-09-24) | calc toolkit: 4 modules + CLI + tests (~730 lines, 10 files) | $0.82 | ~$1.48 ($1.38 Opus + ~$0.10 workers, est.) | ~$0.10 (unpriced profile; est. at DeepSeek list prices) | 283,479 | 5 | 5 (every task first attempt) | yes — each run's suite passes against the other run's implementation; all 34 spec functions and identical error strings in both | **≈ 1.8** |
 
 **Run 1 fails the target, and by the plugin's own rule it should have.** The brief was already a
 complete spec and the code it produced was about the same size, so the code-to-spec ratio was
@@ -176,3 +177,39 @@ Opus alone needed 4 requests and 2.2k output tokens. The supervisor made 28 roun
 cache-read tokens, 9.7k output), so its fixed overhead exceeded the whole cost of just writing
 the code. This measures where delegation does **not** pay: small, fully-specified features.
 Whether it pays on large mechanical work (hundreds of lines per spec) is still unmeasured.
+
+**Run 2 raised the code-to-spec ratio to ~8× and the result improved from 2.8 to 1.8 — still a
+loss.** The brief was 72 lines and produced ~730 lines across 10 files, exactly the shape this
+plugin was built for, split into 5 tasks that all succeeded on the first attempt. Delegation
+still cost 1.8× writing it directly.
+
+Where it goes: the supervisor's own output nearly doubled (10.9k alone vs 18.2k delegating) and
+its requests went from 8 to 19, each one re-reading the whole conversation (1.5M cache-read
+tokens against 402k). Writing five specs and then *reading 732 lines of worker diff* costs more
+than typing the code. Review is invariant I5 and cannot be dropped without breaking the guarantee
+that nothing merges unexamined, so this is a floor, not a bug to fix by trying harder.
+
+What delegation did win on is wall-clock: 4m 15s against 4m 40s, with five workers running in
+parallel and 283k worker tokens that never touched the expensive model. The honest claim for
+this tool is latency, parallelism, and keeping a large mechanical diff out of the supervisor's
+context window — not dollars.
+
+### What would have to change for the ratio to drop below 1
+
+1. **Spec by reference.** The supervisor currently retypes each micro-spec as output tokens. If
+   `dispatch_task` accepted a file path plus a section, the worker could read the brief itself
+   and the supervisor would write one line per task instead of forty.
+2. **Risk-ranked review instead of full-diff review.** Have the server compute a short risk
+   report (files outside the declared scope, new imports or dependencies, `subprocess`/`eval`,
+   deleted or weakened tests, diff-size outliers) and let the supervisor read the full diff only
+   for flagged tasks. This trades some of I5's strength for most of its cost — it needs an
+   explicit decision, not a silent one.
+3. **Batch the review round trip** the way dispatch is already batched: one call approving or
+   rejecting several verified tasks, instead of one call per task.
+4. **Bigger tasks.** Five tasks at ~150 lines each is still near the sweet spot. Fixed overhead
+   per task is the dominant term, so fewer, larger tasks amortise it better — up against the
+   `max_diff_lines` cap and the risk of undecided design choices.
+
+Until at least (1) and (3) ship, delegation is the right tool when the diff would not fit
+comfortably in the supervisor's context, or when wall-clock matters more than cost — and the
+wrong tool when the only goal is a smaller bill.

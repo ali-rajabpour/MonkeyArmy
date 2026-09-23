@@ -7,7 +7,14 @@
 Opus commands, monkeys type, Opus signs off. A Claude Code plugin that delegates
 micro-tasks from a frontier-model supervisor to cheap workers (DeepSeek & co. via
 your local 9Router), isolated in disposable git worktrees, verified by the server,
-and reviewed and merged back by the supervisor — never idle tokens spent on typing.
+and reviewed and merged back by the supervisor.
+
+Measured honestly: on ~730 lines of mechanical work this costs **~1.8× more** than letting the
+frontier model write the code itself, because writing specs and reviewing every diff is not
+cheap. What it buys is wall-clock (workers run in parallel), and a large mechanical diff that
+never has to fit in the supervisor's context window. See
+[`docs/TOKEN-ECONOMICS.md`](docs/TOKEN-ECONOMICS.md) for the numbers and what would have to
+change.
 
 ## What happens
 
@@ -103,7 +110,7 @@ beyond that — this is process isolation and gate enforcement, not a container.
 
 - [`docs/SETUP.md`](docs/SETUP.md) — install and configure
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture, invariants, security model
-- [`docs/TOKEN-ECONOMICS.md`](docs/TOKEN-ECONOMICS.md) — why delegation saves tokens, and when it doesn't
+- [`docs/TOKEN-ECONOMICS.md`](docs/TOKEN-ECONOMICS.md) — what delegation actually costs, measured
 - [`docs/VALIDATION.md`](docs/VALIDATION.md) — the validation checklist this plugin was tested against
 - [`ROADMAP.md`](ROADMAP.md) — what's deliberately not built yet
 

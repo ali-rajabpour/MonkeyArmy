@@ -24,8 +24,16 @@
       "Dispute a finding" on the listing page, then email them — the annotation finding is the
       only scored item that was ever actionable, and it is already fixed. The C grade itself is
       an adoption cap, not something a re-read changes.
-- [ ] Phase 3 A/B on *large* mechanical work — run 1 (small, fully specified) measured 2.8×
-      *worse* delegated; the case the tool is built for is still unmeasured.
+- [x] Phase 3 A/B on *large* mechanical work — run 2 (2026-09-24, ~730 lines over 10 files,
+      5 tasks, all first attempt) measured **1.8× worse** delegated: $0.82 alone against $1.38
+      supervisor + ~$0.10 workers. Better than run 1's 2.8×, still a loss. Quality was equal —
+      each run's suite passes against the other run's implementation. Details and the cost
+      breakdown in `docs/TOKEN-ECONOMICS.md`.
+- [ ] **Cut the supervisor's fixed overhead**, which is what the A/B runs measured. In order of
+      expected return: spec-by-reference in `dispatch_task` (a file path plus a section, so the
+      supervisor stops retyping the brief as output tokens); a batched review call; a
+      server-computed risk report so full-diff review is reserved for flagged tasks. The last one
+      trades part of invariant I5 for most of its cost and needs an explicit decision first.
 
 # Roadmap
 
