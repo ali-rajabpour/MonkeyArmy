@@ -25,6 +25,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 import backend
 import batches
@@ -81,7 +82,11 @@ async def _offload(fn, *args, **kwargs):
         "first and refuses before creating anything if it fails. allowed_files unrestricted is "
         "allowed but returned as a warning. Supervise with wait_for_tasks(include_results=True), "
         "not polling; then review_task(approve, integrate=True) or reject."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=False, openWorldHint=True,
+    ),
 )
 async def dispatch_task(
     title: str,
@@ -228,7 +233,11 @@ async def dispatch_task(
         "failed_oversized, timeout, cancelled, integrated), a `done` flag, and the pending question "
         "if blocked. On 'needs_input' use answer_worker; on `done` call task_result. For files "
         "written so far and recent activity, call task_progress instead."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False,
+        idempotentHint=True, openWorldHint=False,
+    ),
 )
 async def task_status(task_id: str) -> str:
     cfg = _cfg()
@@ -261,7 +270,11 @@ async def task_status(task_id: str) -> str:
         "estimate) or when the user asks 'how's it going?'. Reports elapsed time, step count, cost "
         "so far, the files the worker has touched in its worktree, and its most recent activity "
         "(shell commands, notes). If it looks stuck, steer_task or cancel_task; otherwise keep waiting."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False,
+        idempotentHint=True, openWorldHint=False,
+    ),
 )
 async def task_progress(task_id: str, activity_limit: int = 8) -> str:
     cfg = _cfg()
@@ -304,7 +317,11 @@ async def task_progress(task_id: str, activity_limit: int = 8) -> str:
         "patch (inlined when small enough), cost, and what to do next (review_task or "
         "cleanup_task). Works for non-succeeded tasks too — 'salvaged'/patch still show whatever "
         "work existed at failure/cancel time."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False,
+        idempotentHint=True, openWorldHint=False,
+    ),
 )
 async def task_result(task_id: str, include_patch: bool = True) -> str:
     cfg = _cfg()
@@ -350,7 +367,11 @@ def _result_payload(j: dict[str, Any], cfg: Defaults, include_patch: bool = True
         "Cancels a running task: kills the worker's whole process tree, salvages any uncommitted "
         "work onto the monkey branch (task_result then returns the patch), and marks the "
         "task 'cancelled' so cleanup_task can proceed. Use for stalled or runaway workers."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True,
+        idempotentHint=True, openWorldHint=False,
+    ),
 )
 async def cancel_task(task_id: str) -> str:
     cfg = _cfg()
@@ -414,7 +435,11 @@ async def cancel_task(task_id: str) -> str:
         "course-correct: 'do Y instead', 'skip the tests for now'. Delivered at the worker's next "
         "tool call (seconds, not instant) — it keeps working meanwhile. Overwrites any "
         "not-yet-delivered steer message; only the latest guidance is kept, so batch redirections."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=False, openWorldHint=False,
+    ),
 )
 async def steer_task(task_id: str, message: str) -> str:
     cfg = _cfg()
@@ -450,7 +475,11 @@ async def steer_task(task_id: str, message: str) -> str:
         "Answers a worker that is blocked in status 'needs_input' (it called ask_supervisor or "
         "report_blocker). The answer is delivered out-of-band and the worker resumes immediately. "
         "If the question is a product/user decision, relay it to the user before answering."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=False, openWorldHint=False,
+    ),
 )
 async def answer_worker(task_id: str, answer: str) -> str:
     cfg = _cfg()
@@ -496,7 +525,11 @@ async def answer_worker(task_id: str, answer: str) -> str:
         "Removes the worktree, branch, and persisted file for a finished (non-active) task. Call "
         "once you're done with task_result's patch/summary and (if integrated) after integrate_task "
         "— nothing more can be done with the task afterward. Refuses while running/needs_input/verifying."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True,
+        idempotentHint=True, openWorldHint=False,
+    ),
 )
 async def cleanup_task(task_id: str, delete_branch: bool | None = None) -> str:
     cfg = _cfg()
@@ -518,7 +551,11 @@ async def cleanup_task(task_id: str, delete_branch: bool | None = None) -> str:
         "integrate=True it also merges in the same call. 'reject' (feedback >=10 chars) re-runs the "
         "worker in the SAME worktree with your feedback, incrementing attempt (max 3 — then do it "
         "yourself or re-decompose)."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=False, openWorldHint=True,
+    ),
 )
 async def review_task(
     task_id: str, verdict: str, feedback: str | None = None,
@@ -591,7 +628,11 @@ async def review_task(
         "one already does. Prefer this over polling; each poll turn re-sends your whole context. "
         "include_results=True attaches each finished task's full result (verification, patch), "
         "saving a task_result call. Hard cap 170s — call again for tasks still running."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False,
+        idempotentHint=True, openWorldHint=False,
+    ),
 )
 async def wait_for_tasks(
     task_ids: list[str], timeout_s: int | None = None, include_results: bool = False,
@@ -616,7 +657,11 @@ async def wait_for_tasks(
         "then applied atomically (never half-merged) and, in 'commit' mode, committed under the "
         "user's own git identity. Requires review_task(verdict='approve') first. On conflict, "
         "nothing changes — re-dispatch against the current branch and integrate again."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=False, openWorldHint=False,
+    ),
 )
 async def integrate_task(
     task_id: str, message: str | None = None, mode: str | None = None,
@@ -652,7 +697,11 @@ async def _integrate(
         "verify_command?) integrates every approved task in dependency order and reports totals — "
         "repo_path is optional for status/finish (found from batch_id). tasks_json: JSON list of "
         "{key, title, dependsOn?, allowedFiles?}."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False,
+        idempotentHint=False, openWorldHint=False,
+    ),
 )
 async def batch(
     # *_json params are plain `str`, not `str | None`: mcp<2 only skips its
@@ -798,7 +847,11 @@ async def _configure_store_key(
         "Manages worker profiles, defaults, API keys, and diagnostics: status, set_profile, "
         "remove_profile, set_default, set_defaults, store_key, discover_models, probe, doctor, "
         "add_note, prune, reset. action selects the operation; other args vary per action."
-    )
+    ),
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True,
+        idempotentHint=False, openWorldHint=True,
+    ),
 )
 async def configure(
     action: str,

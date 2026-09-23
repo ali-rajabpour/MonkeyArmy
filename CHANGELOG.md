@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 — 2026-09-23
+
+### Added
+
+- All 13 tools declare `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint`,
+  so a host can warn before invoking a destructive one. `check_descriptions.py` now fails if any
+  tool omits a hint. (Raised by the M8ven inspection; also required by OpenAI's directory.)
+- `SECURITY.md`: how to report a vulnerability, what the plugin does with your machine, and the
+  un-sandboxed-shell limitation stated plainly.
+
 ## 0.2.0 — 2026-09-22
 
 Driven by the first A/B measurement: a fully-specified ~115-line feature cost 2.8× more when

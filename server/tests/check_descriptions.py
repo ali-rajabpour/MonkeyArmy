@@ -43,6 +43,26 @@ def _description_from(call: ast.Call) -> str | None:
     return None
 
 
+annotations: dict[str, dict | None] = {}
+
+HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
+
+
+def _annotation_hints(call: ast.Call) -> dict[str, object] | None:
+    """The four hints declared on @mcp.tool(annotations=ToolAnnotations(...)).
+
+    Hosts use them to warn before invoking a destructive tool, and OpenAI's
+    directory rejects tools where any of the four is missing or non-boolean.
+    """
+    for kw in call.keywords:
+        if kw.arg == "annotations" and isinstance(kw.value, ast.Call):
+            return {
+                k.arg: getattr(k.value, "value", None)
+                for k in kw.value.keywords if k.arg
+            }
+    return None
+
+
 def find_tools(source: str) -> dict[str, str | None]:
     """{tool_name: description}, in source order, for every top-level
     function decorated with `@mcp.tool(...)`."""
@@ -54,6 +74,7 @@ def find_tools(source: str) -> dict[str, str | None]:
         for dec in node.decorator_list:
             if _is_mcp_tool_decorator(dec):
                 tools[node.name] = _description_from(dec)
+                annotations[node.name] = _annotation_hints(dec)
     return tools
 
 
@@ -78,13 +99,22 @@ def main() -> int:
         if words > MAX_WORDS:
             problems.append(f"{name}: description is {words} words (limit {MAX_WORDS})")
 
+    for name in sorted(tools):
+        hints = annotations.get(name)
+        if hints is None:
+            problems.append(f"{name}: no annotations=ToolAnnotations(...)")
+            continue
+        for hint in HINTS:
+            if not isinstance(hints.get(hint), bool):
+                problems.append(f"{name}: {hint} missing or not a literal bool")
+
     if problems:
         print("\nFAILED:")
         for p in problems:
             print(f" - {p}")
         return 1
 
-    print(f"\nOK: {len(tools)} tools, all ≤ {MAX_WORDS} words, matches the exact §6 set.")
+    print(f"\nOK: {len(tools)} tools, all ≤ {MAX_WORDS} words, all four annotation hints declared, matches the exact §6 set.")
     return 0
 
 
