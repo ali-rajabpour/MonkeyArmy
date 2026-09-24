@@ -29,11 +29,19 @@
       supervisor + ~$0.10 workers. Better than run 1's 2.8×, still a loss. Quality was equal —
       each run's suite passes against the other run's implementation. Details and the cost
       breakdown in `docs/TOKEN-ECONOMICS.md`.
-- [ ] **Cut the supervisor's fixed overhead**, which is what the A/B runs measured. In order of
-      expected return: spec-by-reference in `dispatch_task` (a file path plus a section, so the
-      supervisor stops retyping the brief as output tokens); a batched review call; a
-      server-computed risk report so full-diff review is reserved for flagged tasks. The last one
-      trades part of invariant I5 for most of its cost and needs an explicit decision first.
+- [x] **Cut the supervisor's fixed overhead** — shipped in 0.3.0: spec-by-reference
+      (`dispatch_task(spec_file=, spec_section=)`), wave-wide waiting (`wait_for_tasks(require="all")`)
+      and batched verdicts (`review_task(reviews_json=)`). Measured effect: the supervisor's share
+      of a 5-task job fell from 1.68x the direct run to 0.98x (run 3). A 13-task job still came in
+      at 1.33x (run 4), so the overhead is smaller but has not gone away.
+- [ ] **Context headroom is the one claim still untested.** Runs 3 and 4 were greenfield module
+      writing, which never strains a supervisor's context — the direct run peaked at 67.9k tokens
+      over 7 turns. Testing it needs a wide refactor of an existing large codebase, where the
+      direct run must hold what it is changing in context. Until that is measured, claim nothing
+      about it.
+- [ ] Optional: a server-computed risk report so full-diff review is reserved for flagged tasks.
+      Trades part of invariant I5 for most of its cost — needs an explicit decision, not a silent
+      one, and the measurements say it would save little.
 
 # Roadmap
 
