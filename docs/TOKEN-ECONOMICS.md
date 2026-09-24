@@ -170,6 +170,8 @@ To be filled from the user's A/B run — no numbers fabricated.
 | 1 (2026-09-22) | calc: 4 ops + CLI + tests (~115 lines) | $0.65 | ~$1.85 ($1.78 Opus + ~$0.07 workers, est.) | ~$0.07 (unpriced profile; est. at DeepSeek list prices) | 202,075 | 3 | 4 (one re-dispatch after a supervisor-written verify command failed) | yes — 15/15 tests both; add/multiply untouched | **≈ 2.8** |
 | 2 (2026-09-24) | calc toolkit: 4 modules + CLI + tests (~730 lines, 10 files) | $0.82 | ~$1.48 ($1.38 Opus + ~$0.10 workers, est.) | ~$0.10 (unpriced profile; est. at DeepSeek list prices) | 283,479 | 5 | 5 (every task first attempt) | yes — each run's suite passes against the other run's implementation; all 34 spec functions and identical error strings in both | **≈ 1.8** |
 
+| 3 (2026-09-24, v0.3.0) | same brief as run 2, re-run headless (~880 lines, 10 files) | $0.64 | ~$0.73 ($0.62 supervisor + ~$0.11 workers, est.) | ~$0.11 (unpriced profile; est. at DeepSeek list prices) | 320,915 | 5 | 5 (every task first attempt) | yes — both suites pass; the only cross-run failure is a CLI error string the brief never specified | **0.98 supervisor-side, ≈1.15 all-in** |
+
 **Run 1 fails the target, and by the plugin's own rule it should have.** The brief was already a
 complete spec and the code it produced was about the same size, so the code-to-spec ratio was
 ~1×, far below the 3× the granularity rule asks for; `assess` would have said *do it yourself*.
@@ -255,3 +257,45 @@ improving with size. It is a projection, not a measurement; run 3 settles it.
 
 Until those ship, delegation is the right tool when the diff would not fit comfortably in the
 supervisor's context — and the wrong tool when the only goal is a smaller bill.
+
+## Run 3: the 0.3.0 changes, measured
+
+Same brief as run 2, both sides re-run headless (`claude -p`) so the supervisor's own turns are
+the only thing that differs. Headless has no interactive overhead, so run 3's absolute dollars
+are not comparable with run 2's — only A against B within run 3.
+
+| | A (Opus alone) | B (monkey army, v0.3.0) | B in run 2 (v0.2.1) |
+|---|---|---|---|
+| Supervisor cost | $0.636 | **$0.623** | — |
+| Supervisor requests | 7 | **12** | 19 |
+| Supervisor output | 9.4k | **6.3k** | 18.2k |
+| Final context | 49.5k | 81.4k | 105.7k |
+| Wall clock | 75s | 159s | — |
+| Workers | — | 5 tasks, first attempt each, 320,915 tokens | 283,479 |
+
+**B/A on the supervisor side is 0.98 — parity, from 1.68 in run 2.** Counting worker tokens at
+DeepSeek list prices it is ~1.15 all-in, from 1.80.
+
+The three changes did what the per-turn analysis predicted they would:
+
+- **Spec by reference** cut the dispatch turns from 12.8k output tokens to 2.0k. The supervisor
+  passed `spec_file` and a heading; the brief never entered its context.
+- **`require="all"`** cut the wakes: two `wait_for_tasks` calls for two dependency waves, where
+  run 2 woke five times.
+- **Batched review** cut five review calls to two, one per wave.
+
+What did not improve: **wall clock got worse** (159s against 75s). Five parallel cheap workers
+are still slower than one frontier model typing, so latency is not an argument for delegation on
+work this size. Run 2's 9% advantage was noise, and run 3 says the sign is actually negative.
+
+Quality was equal. A's suite reports 72 passing, B's 68; each suite run against the other's
+implementation fails exactly one test, and it is the same test both ways — the CLI's error
+message for a wrong argument count on `vector`, which the brief never specified. Both
+implementations define all 34 specified functions with the specified error strings.
+
+**Where this leaves the thesis.** Supervisor-side parity at ~880 lines means the fixed overhead
+no longer grows with the job, so above this size delegation should start winning on the
+supervisor's own bill — and the supervisor's bill is the one that consumes an Anthropic plan's
+quota, while worker tokens come from a separate budget. It still does not make a feature cheaper
+in absolute dollars, and it is slower. Claim parity plus context headroom, nothing more, until a
+job large enough to compact a direct run has been measured.

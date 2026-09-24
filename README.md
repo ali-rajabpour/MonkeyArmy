@@ -9,12 +9,12 @@ micro-tasks from a frontier-model supervisor to cheap workers (DeepSeek & co. vi
 your local 9Router), isolated in disposable git worktrees, verified by the server,
 and reviewed and merged back by the supervisor.
 
-Measured honestly: on ~730 lines of mechanical work this costs **~1.8× more** than letting the
-frontier model write the code itself, because writing specs and reviewing every diff is not
-cheap. What it buys is wall-clock (workers run in parallel), and a large mechanical diff that
-never has to fit in the supervisor's context window. See
-[`docs/TOKEN-ECONOMICS.md`](docs/TOKEN-ECONOMICS.md) for the numbers and what would have to
-change.
+Measured honestly: on ~880 lines of mechanical work the supervisor's own cost is **the same** as
+letting the frontier model write the code itself (0.98×, three A/B runs in
+[`docs/TOKEN-ECONOMICS.md`](docs/TOKEN-ECONOMICS.md)) — and about 1.15× once worker tokens are
+priced in. So this does not make a feature cheaper. What it buys is a large mechanical diff that
+never has to fit in the supervisor's context window, and implementation volume that comes out of
+a cheap worker's budget instead of your frontier-model quota. It is also slower, not faster.
 
 ## What happens
 
