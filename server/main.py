@@ -31,6 +31,7 @@ import backend
 import batches
 import events
 import git_ops
+import specs
 import store
 import statusline_render
 import verify as verify_mod
@@ -78,10 +79,10 @@ async def _offload(fn, *args, **kwargs):
 @mcp.tool(
     description=(
         "Starts an autonomous coding worker on an isolated git worktree and returns a task_id "
-        "IMMEDIATELY — the worker runs in the background and you stay free. Probes the profile "
-        "first and refuses before creating anything if it fails. allowed_files unrestricted is "
-        "allowed but returned as a warning. Supervise with wait_for_tasks(include_results=True), "
-        "not polling; then review_task(approve, integrate=True) or reject."
+        "IMMEDIATELY — the worker runs in the background and you stay free. Give spec, or "
+        "spec_file (+spec_section) so the server reads it from a file instead of you retyping "
+        "it. Probes the profile first and refuses before creating anything. Supervise with "
+        "wait_for_tasks(require=\'all\', include_results=True)."
     ),
     annotations=ToolAnnotations(
         readOnlyHint=False, destructiveHint=False,
@@ -90,8 +91,10 @@ async def _offload(fn, *args, **kwargs):
 )
 async def dispatch_task(
     title: str,
-    spec: str,
-    repo_path: str,
+    spec: str = "",
+    repo_path: str = "",
+    spec_file: str | None = None,
+    spec_section: str | None = None,
     test_command: str | None = None,
     definition_of_done: str | None = None,
     allowed_files: list[str] | None = None,
@@ -110,6 +113,20 @@ async def dispatch_task(
     cfg = _cfg()
     if mode not in ("micro", "task"):
         return json.dumps({"error": f"mode must be 'micro' or 'task', got {mode!r}"})
+    if not repo_path:
+        return json.dumps({"error": "repo_path is required"})
+
+    # Spec by reference: let the server read the brief rather than have the
+    # supervisor retype it as output tokens (docs/TOKEN-ECONOMICS.md).
+    if spec_file:
+        if spec:
+            return json.dumps({"error": "pass spec or spec_file, not both"})
+        try:
+            spec = specs.read_spec(spec_file, spec_section)
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+    elif not spec:
+        return json.dumps({"error": "spec is required (or pass spec_file)"})
 
     repo_err = await _offload(repo_worktree_error, repo_path)
     if repo_err:
@@ -151,6 +168,7 @@ async def dispatch_task(
     job: dict[str, Any] = {
         **wt,
         "title": title, "spec": spec,
+        "specFile": spec_file, "specSection": spec_section,
         "testCommand": test_command, "definitionOfDone": definition_of_done,
         "verifyCommand": verify_command, "lintCommand": lint_command,
         "allowedFiles": allowed_files or [], "contextFiles": context_files or [],
@@ -549,8 +567,8 @@ async def cleanup_task(task_id: str, delete_branch: bool | None = None) -> str:
     description=(
         "Records your verdict on a 'succeeded' task. 'approve' unlocks integration; with "
         "integrate=True it also merges in the same call. 'reject' (feedback >=10 chars) re-runs the "
-        "worker in the SAME worktree with your feedback, incrementing attempt (max 3 — then do it "
-        "yourself or re-decompose)."
+        "worker in the SAME worktree, incrementing attempt (max 3). reviews_json — a JSON list of "
+        "{task_id, verdict, feedback?, integrate?} — reviews a whole wave in one round trip."
     ),
     annotations=ToolAnnotations(
         readOnlyHint=False, destructiveHint=False,
@@ -558,10 +576,40 @@ async def cleanup_task(task_id: str, delete_branch: bool | None = None) -> str:
     ),
 )
 async def review_task(
-    task_id: str, verdict: str, feedback: str | None = None,
+    task_id: str = "", verdict: str = "", feedback: str | None = None,
     integrate: bool = False, integrate_mode: str | None = None,
+    reviews_json: str = "",
 ) -> str:
     cfg = _cfg()
+    if reviews_json:
+        # One round trip for a whole wave of verdicts. Each separate review call
+        # re-sends the supervisor's entire context, and the A/B runs measured
+        # that tax as most of the orchestration cost (docs/TOKEN-ECONOMICS.md).
+        try:
+            rows = json.loads(reviews_json)
+        except json.JSONDecodeError as e:
+            return json.dumps({"error": f"reviews_json is not valid JSON: {e}"})
+        if not isinstance(rows, list) or not rows:
+            return json.dumps({"error": "reviews_json must be a non-empty JSON list"})
+        out = []
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("task_id"):
+                out.append({"error": f"each review needs a task_id: {row!r}"})
+                continue
+            out.append(json.loads(await _review_one(
+                cfg, row["task_id"], row.get("verdict", ""), row.get("feedback"),
+                row.get("integrate", integrate), row.get("integrate_mode", integrate_mode),
+            )))
+        return json.dumps({"reviews": out})
+    if not task_id:
+        return json.dumps({"error": "task_id is required (or pass reviews_json)"})
+    return await _review_one(cfg, task_id, verdict, feedback, integrate, integrate_mode)
+
+
+async def _review_one(
+    cfg: Defaults, task_id: str, verdict: str, feedback: str | None,
+    integrate: bool, integrate_mode: str | None,
+) -> str:
     j = get_job_with_fallback(task_id)
     if not j:
         return json.dumps({"error": "unknown task_id"})
@@ -624,10 +672,10 @@ async def review_task(
 
 @mcp.tool(
     description=(
-        "Waits server-side until any listed task changes status or needs input; returns at once if "
-        "one already does. Prefer this over polling; each poll turn re-sends your whole context. "
-        "include_results=True attaches each finished task's full result (verification, patch), "
-        "saving a task_result call. Hard cap 170s — call again for tasks still running."
+        "Waits server-side until a listed task changes status or needs input; returns at once if "
+        "one already does. require=\'all\' waits for every task instead of waking on the first — "
+        "prefer it, each wake re-sends your whole context. include_results=True attaches each "
+        "finished task\'s result, saving a task_result call. Hard cap 170s."
     ),
     annotations=ToolAnnotations(
         readOnlyHint=True, destructiveHint=False,
@@ -636,9 +684,14 @@ async def review_task(
 )
 async def wait_for_tasks(
     task_ids: list[str], timeout_s: int | None = None, include_results: bool = False,
+    require: str = "any",
 ) -> str:
     cfg = _cfg()
-    result = await jobs_wait_for_tasks(task_ids, timeout_s, cfg.wait_timeout_s, cfg.wait_hard_cap_s)
+    if require not in ("any", "all"):
+        return json.dumps({"error": f"require must be 'any' or 'all', got {require!r}"})
+    result = await jobs_wait_for_tasks(
+        task_ids, timeout_s, cfg.wait_timeout_s, cfg.wait_hard_cap_s, require
+    )
     if include_results:
         # Every supervisor round trip re-sends its whole context. Folding the
         # finished tasks' results into the wait saves one task_result call

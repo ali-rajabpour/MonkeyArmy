@@ -683,7 +683,86 @@ async def phase1(ctx: Ctx) -> None:
         wt_after = _git(ctx.work_dir, "worktree", "list", "--porcelain").stdout.count("worktree ")
         record("T1.5 no worktree created", wt_after == wt_before, f"before={wt_before} after={wt_after}")
 
-    for label, fn in (("T1.1", t1_1), ("T1.2", t1_2), ("T1.4", t1_4), ("T1.5", t1_5)):
+    async def t1_6() -> None:
+        # T1.6 -- the cheap supervisor path: spec read from a file, one wait for
+        # the whole wave, one batched review+integrate. Three round trips for two
+        # tasks instead of ten (docs/TOKEN-ECONOMICS.md).
+        brief = Path(ctx.env["MONKEY_ARMY_HOME"]) / "brief.md"
+        brief.write_text(
+            "# Brief\n\n## task one\n\n"
+            + spec_text(
+                "Create fixtures/one.txt containing the single line 'one'.",
+                args, "ok", writes=[{"path": "fixtures/one.txt", "content": "one\n"}],
+            )
+            + "\n\n## task two\n\n"
+            + spec_text(
+                "Create fixtures/two.txt containing the single line 'two'.",
+                args, "ok", writes=[{"path": "fixtures/two.txt", "content": "two\n"}],
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        r1 = await ctx.call(
+            "dispatch_task", title="T1.6 one", repo_path=str(ctx.work_dir), profile=ctx.profile,
+            spec_file=str(brief), spec_section="task one", allowed_files=["fixtures/one.txt"],
+        )
+        r2 = await ctx.call(
+            "dispatch_task", title="T1.6 two", repo_path=str(ctx.work_dir), profile=ctx.profile,
+            spec_file=str(brief), spec_section="task two", allowed_files=["fixtures/two.txt"],
+        )
+        ids = [r.get("task_id") for r in (r1, r2)]
+        for tid in ids:
+            if tid:
+                ctx.active_task_ids.add(tid)
+        if not record("T1.6 dispatch from spec_file", all(ids), json.dumps([r1, r2])[:300]):
+            return
+
+        bad = await ctx.call(
+            "dispatch_task", title="T1.6 missing section", repo_path=str(ctx.work_dir),
+            profile=ctx.profile, spec_file=str(brief), spec_section="task three",
+        )
+        record(
+            "T1.6 unknown spec_section refuses the dispatch",
+            "task_id" not in bad and "task three" in str(bad.get("error", "")),
+            json.dumps(bad)[:300],
+        )
+
+        deadline = time.time() + ctx.task_timeout
+        rows: list[dict] = []
+        while time.time() < deadline:
+            w = await ctx.call(
+                "wait_for_tasks", task_ids=ids, timeout_s=60, include_results=True, require="all",
+            )
+            rows = w.get("tasks") or []
+            if rows and all(row.get("done") for row in rows):
+                break
+        record(
+            "T1.6 require='all' returns only when every task is done",
+            bool(rows) and all(row.get("done") for row in rows),
+            json.dumps([{k: row.get(k) for k in ("task_id", "status")} for row in rows]),
+        )
+        record(
+            "T1.6 the spec the worker ran came from the file",
+            all((row.get("result") or {}).get("status") == "succeeded" for row in rows),
+            json.dumps([(row.get("result") or {}).get("error") for row in rows]),
+        )
+
+        r_rev = await ctx.call(
+            "review_task",
+            reviews_json=json.dumps([{"task_id": tid, "verdict": "approve"} for tid in ids]),
+            integrate=True,
+        )
+        reviews = r_rev.get("reviews") or []
+        record(
+            "T1.6 one batched call approves and integrates the wave",
+            len(reviews) == 2 and all((x.get("integrate") or {}).get("integrated") for x in reviews),
+            json.dumps(r_rev)[:400],
+        )
+        for tid in ids:
+            await ctx.cleanup(tid)
+
+    for label, fn in (("T1.1", t1_1), ("T1.2", t1_2), ("T1.4", t1_4), ("T1.5", t1_5), ("T1.6", t1_6)):
         await run_block(ctx, label, fn)
 
 

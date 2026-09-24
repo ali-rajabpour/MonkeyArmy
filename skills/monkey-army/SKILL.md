@@ -71,6 +71,11 @@ would have to decide anything (name, shape, dependency, approach), you under-dec
 it, bake it into the spec, shrink the task.
 - Write each spec with `references/spec-template.md`: exact file, exact change, signatures/types
   inline, conventions to follow, `allowed_files`, `context_files`, acceptance.
+- **Never retype a spec that already exists on disk.** If the user gave you a brief, a design doc
+  or an issue file whose sections map to tasks, dispatch with `spec_file` (+ `spec_section`) and
+  let the server read it. Measured: retyped spec prose was 70% of the supervisor's output tokens
+  in the run-2 benchmark. If you must compose the decomposition yourself, write it once to a file
+  and dispatch every task from that file's sections.
 - **TDD split for logic:** task A = "write these N test cases in <test file>" (you list them),
   you review the tests; task B = "make them pass in <file>". The tests become the objective gate.
 - **Prefer fewer, larger tasks.** Each task costs you ~3 round trips; don't split what one task
@@ -81,16 +86,21 @@ it, bake it into the spec, shrink the task.
 
 ### 2.3 Dispatch
 For each task in the current wave, one `dispatch_task(...)` call with `batch_id` and `batch_key`;
-put all independent dispatches in the same turn. Check `preflight`: a non-zero exit is normal if
+put all independent dispatches in the same turn. Pass `spec` only for a spec you had to compose
+in-conversation; otherwise `spec_file` + `spec_section`, which keeps the brief out of your
+context as well as your output. A missing file or heading fails the dispatch loudly — fix it,
+never fall back to retyping. Check `preflight`: a non-zero exit is normal if
 tests target code that doesn't exist yet, but if the *runner* is broken (module not found,
 unknown option) fix `test_command` and re-dispatch — never let a monkey fight a broken gate.
 Use `mode="micro"` (default). Use `mode="task"` only for a coherent multi-file lot you
 deliberately chose not to split. Do not pass `profile` unless the user asked for a specific one.
 
 ### 2.4 Wait and supervise (never idle-poll)
-Call `wait_for_tasks(task_ids, include_results=True)` — it returns on the first state change,
-and every finished task arrives with its full result (verification, scope, diffstat, patch).
-Every extra poll turn re-sends your whole context; this is the cheap path.
+Call `wait_for_tasks(task_ids, include_results=True, require="all")` — it returns once the whole
+wave is finished, with every task's full result (verification, scope, diffstat, patch) attached.
+Use `require="any"` only when you genuinely need to act on the first finisher. Each wake costs a
+round trip that re-sends your whole context, so waking five times for five tasks is five times
+the tax for no extra information.
 - `needs_input`: read the question. Answer from your own context with `answer_worker` when it is
   an implementation detail you already decided; relay to the user only genuine product decisions.
   Answer promptly — the worker is blocked.
@@ -109,7 +119,9 @@ Then, in this order:
    tests meaningful? Would you have written it this way?
 3. Judge: `review_task(task_id, "approve", integrate=True)` — approves and merges in one call —
    or `review_task(task_id, "reject", feedback)` with
-   the **exact** problem, the root cause, and the fix you want. You diagnose; the monkey retypes in
+   the **exact** problem, the root cause, and the fix you want. Reviewed a whole wave? Send the
+   verdicts in one call: `review_task(reviews_json='[{"task_id": ..., "verdict": "approve"}, ...]',
+   integrate=True)`. Read every diff first — batching the *call* is not batching the *reading*. You diagnose; the monkey retypes in
    the same worktree. After two rejects, stop: do it yourself or re-decompose.
 Never trust `summary`. Never approve on "tests pass" alone — read the diff.
 
@@ -150,6 +162,8 @@ only durable operational facts ("tests need `uv run pytest -q`").
 ## 4. Common mistakes
 - Writing the code yourself "because it's faster" — that is the exact cost you are avoiding.
 - Polling `task_status` in a loop instead of `wait_for_tasks`.
+- Waking once per task (`require="any"`) when the whole wave has to finish anyway.
+- Retyping a spec that is already a file on disk instead of passing `spec_file`.
 - Specs that make the worker explore ("find where X is handled") — you name the file and line.
 - Tasks that touch many files, or two parallel tasks sharing a file.
 - Approving because tests are green without reading the diff.
@@ -157,7 +171,13 @@ only durable operational facts ("tests need `uv run pytest -q`").
 - Serialising independent tasks.
 
 ## 5. Cost model, honestly
-You spend expensive tokens on decomposition and review (small, high-value) and push
-implementation volume onto cheap workers. It pays only when tasks are small enough that rework is
-rare, and only when you wait instead of poll. Expect 30–60% savings on implementation-heavy work
-and no savings on design-heavy or tiny work — say so to the user when you assess.
+You spend expensive tokens on decomposition and review and push implementation volume onto cheap
+workers — but two A/B runs measured delegation costing **more**, not less: 2.8x on a 115-line
+feature, 1.8x on 730 lines across 10 files (`docs/TOKEN-ECONOMICS.md`). The reason is structural:
+your own turns re-send your whole context, and a run's first turn alone (loading the system
+prompt) is about a third of what writing the feature directly costs.
+
+So do not promise the user savings. What delegation reliably buys is a large mechanical diff that
+never has to fit in your context, worker tokens that are not yours, and parallel execution. Say
+exactly that when you assess, and if the user's goal is a smaller bill on a small feature, tell
+them to let you write it.

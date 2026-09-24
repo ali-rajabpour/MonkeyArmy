@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.0 — 2026-09-24
+
+Cuts the supervisor's fixed overhead, which two A/B benchmarks identified as the reason
+delegation cost more than writing the code directly (`docs/TOKEN-ECONOMICS.md`).
+
+### Added
+
+- `dispatch_task(spec_file=..., spec_section=...)`: the server reads the micro-spec out of a file
+  instead of the supervisor retyping it. Retyped spec prose was 12.8k of the supervisor's 18.2k
+  output tokens in the run-2 benchmark, and the brief it was transcribing already existed on disk.
+  A missing file or heading fails the dispatch rather than starting a worker on a half-read spec.
+- `wait_for_tasks(require="all")`: wait for the whole wave instead of waking on the first
+  finisher. A task that asks a question still returns immediately. Eleven of the nineteen
+  supervisor turns in run 2 were wakes like these, carrying 1.8k output between them.
+- `review_task(reviews_json=...)`: one round trip for a wave of verdicts, each optionally
+  integrating. Per-task review calls were the other half of the orchestration tax.
+- `tools/ab_cost.py`: prices each supervisor turn from a session transcript, so the next
+  benchmark reports where the money went instead of estimating it.
+
+### Changed
+
+- The skill's loop uses the cheap path throughout, and its cost section no longer promises
+  "30–60% savings" — it states the measured 1.8x–2.8x and what delegation actually buys.
+- README's opening claim corrected the same way.
+
 ## 0.2.1 — 2026-09-23
 
 ### Added

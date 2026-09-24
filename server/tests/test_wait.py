@@ -73,6 +73,44 @@ class TestWaitForTasks(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(result["elapsed_s"], 1)
         self.assertLess(result["elapsed_s"], 3)
 
+    async def test_require_all_waits_for_every_task(self):
+        """require='all' must not wake on the first finisher: every wake costs
+        the supervisor a round trip that re-sends its whole context."""
+        done = {"taskId": "mk_g1", "status": "succeeded"}
+        slow = {"taskId": "mk_g2", "status": "running"}
+        put_job(done)
+        put_job(slow)
+
+        async def finish_later():
+            await asyncio.sleep(1.2)
+            slow["status"] = "succeeded"
+
+        asyncio.create_task(finish_later())
+        result = await wait_for_tasks(
+            ["mk_g1", "mk_g2"], 10, wait_timeout_s=10, hard_cap_s=170, require="all"
+        )
+        self.assertGreaterEqual(result["elapsed_s"], 1)
+        self.assertTrue(all(r["done"] for r in result["tasks"]))
+
+    async def test_require_all_returns_immediately_on_a_question(self):
+        """A blocked worker is the one thing only the supervisor can unblock."""
+        put_job({"taskId": "mk_h1", "status": "needs_input", "question": {"id": "q7", "message": "which?"}})
+        put_job({"taskId": "mk_h2", "status": "running"})
+        result = await wait_for_tasks(
+            ["mk_h1", "mk_h2"], 10, wait_timeout_s=10, hard_cap_s=170, require="all"
+        )
+        self.assertEqual(result["elapsed_s"], 0)
+        self.assertEqual(result["tasks"][0]["question"]["id"], "q7")
+
+    async def test_require_all_times_out_without_every_task_done(self):
+        put_job({"taskId": "mk_i1", "status": "succeeded"})
+        put_job({"taskId": "mk_i2", "status": "running"})
+        result = await wait_for_tasks(
+            ["mk_i1", "mk_i2"], 2, wait_timeout_s=10, hard_cap_s=170, require="all"
+        )
+        self.assertFalse(result["changed"])
+        self.assertGreaterEqual(result["elapsed_s"], 2)
+
     async def test_unknown_task_id_is_done_immediately(self):
         result = await wait_for_tasks(["mk_never_seen"], None, wait_timeout_s=10, hard_cap_s=170)
         self.assertTrue(result["tasks"][0]["done"])

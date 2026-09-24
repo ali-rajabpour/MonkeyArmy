@@ -244,6 +244,9 @@ reachable on a feature this size.
    per task is the dominant term, so fewer, larger tasks amortise it better — up against the
    `max_diff_lines` cap and the risk of undecided design choices.
 
+**Shipped in 0.3.0:** `dispatch_task(spec_file=, spec_section=)`, `wait_for_tasks(require="all")`
+and `review_task(reviews_json=)` — items (1), (2) and (3) above, minus the sub-agent review.
+
 Measured against the table above, the order is: collapsing the orchestration turns is worth
 about $0.45, spec-by-reference about $0.30, and sub-agent review roughly nothing in dollars once
 the sub-agent's own cost is added back — its value is keeping large diffs out of the supervisor's

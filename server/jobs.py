@@ -85,10 +85,17 @@ def get_job_with_fallback(task_id: str) -> dict[str, Any] | None:
 
 async def wait_for_tasks(
     task_ids: list[str], timeout_s: int | None, wait_timeout_s: int, hard_cap_s: int,
+    require: str = "any",
 ) -> dict[str, Any]:
     """§6.2: returns immediately if any listed task already needs input or is
     done; otherwise sleeps in 1s ticks until any task's status changes or the
-    (hard-capped) timeout elapses. Lives here (stdlib) rather than in main.py
+    (hard-capped) timeout elapses.
+
+    require="all" waits for every task to finish instead of waking on the first
+    one. A task asking a question still returns immediately — the supervisor is
+    the only thing that can unblock it. Each wake costs a supervisor round trip
+    that re-sends its whole context, so waking five times for five tasks was
+    most of the orchestration overhead the A/B runs measured. Lives here (stdlib) rather than in main.py
     so it's testable without the `mcp` dependency — main.py's wait_for_tasks
     tool is a thin wrapper that supplies the two Defaults-derived bounds.
     """
@@ -116,15 +123,23 @@ async def wait_for_tasks(
     def fingerprint(rows: list[dict[str, Any]]) -> tuple:
         return tuple((r["task_id"], r["status"], (r.get("question") or {}).get("id")) for r in rows)
 
+    def settled(rows: list[dict[str, Any]]) -> bool:
+        if any(r["status"] == "needs_input" for r in rows):
+            return True
+        if require == "all":
+            return all(r["done"] for r in rows)
+        return any(r["done"] for r in rows)
+
     initial = snapshot()
-    if any(r["done"] or r["status"] == "needs_input" for r in initial):
+    if settled(initial):
         return {"elapsed_s": 0, "changed": False, "tasks": initial}
 
     initial_print = fingerprint(initial)
     while time.time() - start < budget:
         await asyncio.sleep(1)
         current = snapshot()
-        if fingerprint(current) != initial_print:
+        woke = settled(current) if require == "all" else fingerprint(current) != initial_print
+        if woke:
             return {"elapsed_s": round(time.time() - start, 1), "changed": True, "tasks": current}
 
     return {"elapsed_s": round(time.time() - start, 1), "changed": False, "tasks": snapshot()}
