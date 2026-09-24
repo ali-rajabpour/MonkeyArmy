@@ -194,6 +194,40 @@ parallel and 283k worker tokens that never touched the expensive model. The hone
 this tool is latency, parallelism, and keeping a large mechanical diff out of the supervisor's
 context window — not dollars.
 
+### Where run 2's money actually went
+
+`tools/ab_cost.py` prices each supervisor turn from the session transcript (deduplicated by
+`requestId`; totals reconcile with `/cost` exactly). Run it as:
+
+```bash
+python3 tools/ab_cost.py ~/.claude/projects/<slug>/<session>.jsonl 1.38
+```
+
+Run 2, delegating (19 requests, $1.38):
+
+| Group | Turns | Supervisor output | Cost |
+|---|---|---|---|
+| Startup, repo reading, running tests (`Bash`) | 4 | 1.8k | $0.34 |
+| Writing specs (`batch`, `dispatch_task`) | 3 | 12.8k | $0.36 |
+| Pure orchestration (`configure`, `wait_for_tasks`, `review_task`, `integrate_task`) | 11 | 1.8k | $0.62 |
+| Final report | 1 | 0.9k | $0.06 |
+
+Two things fall out of this that guesswork got wrong.
+
+**The orchestration turns are almost pure context tax.** Eleven turns produced 1.8k output
+between them — they decide almost nothing — yet they cost $0.62, because each one re-bills a
+conversation that grew from 54.5k to 105.7k tokens. Delegation added ~36k of permanent context
+(worker diffs, tool results, specs) on top of the ~15k the direct run grew by.
+
+**Most of the supervisor's output is retyped spec.** 12.8k of 18.2k output tokens are the micro-
+specs — and in run 2 the brief on disk was already sectioned one-to-one with the five tasks, so
+the supervisor was re-typing prose that already existed.
+
+For scale, the direct run's very first turn costs $0.30 of its $0.82: writing the 50k-token
+system prompt (persona, CLAUDE.md, MCP tool schemas) into cache. Both runs pay it, and no
+delegation design can avoid it. That fixed floor, not the loop, is why a ratio of 0.6 was never
+reachable on a feature this size.
+
 ### What would have to change for the ratio to drop below 1
 
 1. **Spec by reference.** The supervisor currently retypes each micro-spec as output tokens. If
@@ -210,6 +244,11 @@ context window — not dollars.
    per task is the dominant term, so fewer, larger tasks amortise it better — up against the
    `max_diff_lines` cap and the risk of undecided design choices.
 
-Until at least (1) and (3) ship, delegation is the right tool when the diff would not fit
-comfortably in the supervisor's context, or when wall-clock matters more than cost — and the
-wrong tool when the only goal is a smaller bill.
+Measured against the table above, the order is: collapsing the orchestration turns is worth
+about $0.45, spec-by-reference about $0.30, and sub-agent review roughly nothing in dollars once
+the sub-agent's own cost is added back — its value is keeping large diffs out of the supervisor's
+context. That projects to ~$0.78 against the direct run's $0.82, i.e. parity at 730 lines and
+improving with size. It is a projection, not a measurement; run 3 settles it.
+
+Until those ship, delegation is the right tool when the diff would not fit comfortably in the
+supervisor's context — and the wrong tool when the only goal is a smaller bill.
