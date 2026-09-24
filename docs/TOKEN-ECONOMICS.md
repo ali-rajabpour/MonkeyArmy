@@ -172,6 +172,8 @@ To be filled from the user's A/B run — no numbers fabricated.
 
 | 3 (2026-09-24, v0.3.0) | same brief as run 2, re-run headless (~880 lines, 10 files) | $0.64 | ~$0.73 ($0.62 supervisor + ~$0.11 workers, est.) | ~$0.11 (unpriced profile; est. at DeepSeek list prices) | 320,915 | 5 | 5 (every task first attempt) | yes — both suites pass; the only cross-run failure is a CLI error string the brief never specified | **0.98 supervisor-side, ≈1.15 all-in** |
 
+| 4 (2026-09-24, v0.3.0) | 12-module toolkit from a 165-line brief, both runs headless | $1.06 | ~$1.75 ($1.41 supervisor + ~$0.34 workers, est.) | ~$0.34 (unpriced profile; est. at DeepSeek list prices) | 969,235 | 13 | 14 (one retry on `dates`) | yes — all 86 specified functions both sides; the only cross-run failures are a CLI error string the brief never specified | **1.33 supervisor-side, ≈1.65 all-in** |
+
 **Run 1 fails the target, and by the plugin's own rule it should have.** The brief was already a
 complete spec and the code it produced was about the same size, so the code-to-spec ratio was
 ~1×, far below the 3× the granularity rule asks for; `assess` would have said *do it yourself*.
@@ -299,3 +301,53 @@ supervisor's own bill — and the supervisor's bill is the one that consumes an 
 quota, while worker tokens come from a separate budget. It still does not make a feature cheaper
 in absolute dollars, and it is slower. Claim parity plus context headroom, nothing more, until a
 job large enough to compact a direct run has been measured.
+
+## Run 4: the large-job test
+
+The brief was scaled up to 12 modules and ~86 functions (165 lines of spec) to find the size
+where delegation's fixed overhead finally amortises. It did not amortise.
+
+| | A (Opus alone) | B (monkey army, v0.3.0) |
+|---|---|---|
+| Supervisor cost | $1.057 | $1.408 |
+| Worker cost | — | ~$0.34 (969,235 tokens, est.) |
+| Supervisor requests | 7 | 22 |
+| Supervisor output | 25.0k | 16.3k |
+| Peak context | 67.9k | 101.1k |
+| Wall clock | 190s | 264s |
+| Delivered | 1,730 lines, 103 tests | 2,923 lines, 250 tests |
+
+**B/A = 1.33 supervisor-side, ~1.65 all-in** — worse than run 3's 0.98, on a job three times the
+size. Delegation's per-task overhead is still about 1.7 supervisor turns, and thirteen tasks cost
+more of them than five did.
+
+One reading favours delegation and is worth stating precisely, because it is the only one that
+does. The two runs did not deliver the same volume: A satisfied the brief with 1,730 lines and
+103 tests, while B's thirteen independent workers each wrote thorough tests for their own module
+and produced 2,923 lines and 250 tests. Per line delivered, A costs $6.11 per 100 lines and B
+costs $4.82 supervisor-side (~$5.99 all-in). So delegation buys more code per dollar, but not the
+same job for fewer dollars — and "more tests than asked for" is only a benefit if you wanted them.
+
+Functionally the two are equivalent: all 86 specified functions exist on both sides with the
+specified error messages, and running each suite against the other's implementation fails exactly
+two tests, both the same unspecified CLI error string for a missing argument.
+
+### What this run did not test
+
+The direct run peaked at **67.9k context over 7 turns** — nowhere near compaction. Writing
+greenfield modules does not strain a supervisor's context, because it never has to read back what
+it wrote. The context-headroom case needs a job that holds a large existing codebase in context
+*while* changing it — a wide refactor, not a fresh build — and that case remains unmeasured.
+
+### The four runs together
+
+| Run | Size | B / A |
+|---|---|---|
+| 1 | ~115 lines, 3 tasks | 2.8 |
+| 2 | ~730 lines, 5 tasks | 1.8 |
+| 3 | ~880 lines, 5 tasks, v0.3.0 | 0.98 |
+| 4 | ~1.7–2.9k lines, 13 tasks, v0.3.0 | 1.33 |
+
+Delegation never cost less than writing the code directly for an equivalent spec. The v0.3.0
+round-trip cuts brought the best case to parity; scale did not push it past. Treat any claim of
+token savings from this plugin as unsupported by its own measurements.

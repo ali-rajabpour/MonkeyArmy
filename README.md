@@ -9,12 +9,15 @@ micro-tasks from a frontier-model supervisor to cheap workers (DeepSeek & co. vi
 your local 9Router), isolated in disposable git worktrees, verified by the server,
 and reviewed and merged back by the supervisor.
 
-Measured honestly: on ~880 lines of mechanical work the supervisor's own cost is **the same** as
-letting the frontier model write the code itself (0.98×, three A/B runs in
-[`docs/TOKEN-ECONOMICS.md`](docs/TOKEN-ECONOMICS.md)) — and about 1.15× once worker tokens are
-priced in. So this does not make a feature cheaper. What it buys is a large mechanical diff that
-never has to fit in the supervisor's context window, and implementation volume that comes out of
-a cheap worker's budget instead of your frontier-model quota. It is also slower, not faster.
+Measured honestly, four times (`docs/TOKEN-ECONOMICS.md`): delegation has **never cost less**
+than letting the frontier model write the code itself. The best case is parity — 0.98x on ~880
+lines — and a 13-task job came in at 1.33x supervisor-side, 1.65x counting worker tokens. It is
+also slower. So this is not a way to make a feature cheaper.
+
+What it does buy: implementation volume that comes out of a cheap worker's budget instead of your
+frontier-model quota, a large mechanical diff that never has to fit in the supervisor's context,
+and a harness — disposable worktrees, server-run verification, scope enforcement, atomic apply —
+that keeps a cheap model's output from ever touching your working tree unreviewed.
 
 ## What happens
 
